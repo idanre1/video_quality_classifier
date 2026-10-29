@@ -304,27 +304,41 @@ def in_uv_venv():
 
 
 def ensure_resdet():
-    """Return the resdet binary inside this venv, building it there on first use (needs cc + make)."""
+    """Return the resdet binary inside this venv, building it there on first use (needs bash, cc, make)."""
     exe = Path(sys.prefix, "bin", "resdet")
     if exe.is_file():
         return str(exe)
+    log = Path(sys.prefix, "resdet-build.log")
     print(f"resdet {RESDET_VERSION} not in venv; building it into {exe.parent} (one-time)...", file=sys.stderr)
+    step = "download"
+    log.unlink(missing_ok=True)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             with urllib.request.urlopen(RESDET_URL, timeout=60) as resp:
                 with tarfile.open(fileobj=io.BytesIO(resp.read()), mode="r:gz") as tf:
                     tf.extractall(tmp, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
             src = Path(tmp, f"resdet-{RESDET_VERSION}")
-            for cmd in (["./configure"], ["make", f"-j{os.cpu_count() or 2}"]):
-                subprocess.run(cmd, cwd=src, check=True, capture_output=True, text=True)
+            # Only the built-in Y4M reader is needed: no pkg-config, no optional libs (whose versions can break
+            # the build). "bash configure" also works when /tmp is mounted noexec.
+            for step, cmd in (("configure", ["bash", "configure", "--disable-everything"]),
+                              ("make", ["make", f"-j{os.cpu_count() or 2}"])):
+                # -Wno-error: resdet builds with -Werror, which breaks on newer compilers' new warnings.
+                env = {**os.environ, "CFLAGS": (os.environ.get("CFLAGS", "") + " -Wno-error").strip()}
+                p = subprocess.run(cmd, cwd=src, capture_output=True, text=True, env=env)
+                with open(log, "a") as fh:
+                    fh.write(f"$ {' '.join(cmd)}\n{p.stdout}\n{p.stderr}\n")
+                if p.returncode:
+                    raise RuntimeError((p.stdout + p.stderr).strip()[-600:])
             shutil.copy2(src / "resdet", exe)
         return str(exe)
     except Exception as e:
-        detail = (getattr(e, "stderr", None) or str(e)).strip()[-400:]
-        print(f"WARNING: could not build resdet ({detail})\n"
+        hint = {"download": f"check network/proxy access to {RESDET_URL}",
+                "configure": "needs bash and a C compiler (sudo apt install build-essential)",
+                "make": "needs make and a C compiler (sudo apt install build-essential)"}[step]
+        print(f"WARNING: resdet build failed at {step}: {e}\n"
+              f"  Hint: {hint}. Full log: {log}\n"
               "  --deep continues with round-trip SSIM only (upscale source heights are less exact).\n"
-              "  Fix: install a C compiler and make (e.g. sudo apt install build-essential), then rerun;\n"
-              "  or build it yourself and pass --resdet /path/to/resdet", file=sys.stderr)
+              "  Or build it yourself and pass --resdet /path/to/resdet", file=sys.stderr)
         return None
 
 

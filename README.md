@@ -10,7 +10,7 @@ File size is misleading: old codecs (Xvid, MPEG-2) need far more data for the sa
 |---|---|
 | [uv](https://docs.astral.sh/uv/) | `vqc` runs only inside its uv venv; plain `python3 vqc.py` refuses to start |
 | ffmpeg (`ffprobe`, `ffmpeg`) | metadata probing and frame sampling |
-| C compiler + `make` (optional) | to build [resdet](https://github.com/0x09/resdet) automatically on the first `--deep` run (`sudo apt install build-essential`) |
+| C compiler, `make`, `bash`, access to github.com (optional) | to build [resdet](https://github.com/0x09/resdet) automatically on the first `--deep` run (`sudo apt install build-essential`). No `pkg-config` or extra libraries needed. If the build fails, the warning names the failing step and the full log is in `<venv>/resdet-build.log` |
 
 There are no Python package dependencies.
 
