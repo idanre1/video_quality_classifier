@@ -32,6 +32,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from tqdm import tqdm
+
 VIDEO_EXTS = {
     ".mp4", ".m4v", ".mkv", ".avi", ".mov", ".wmv", ".asf", ".flv", ".webm", ".mpg", ".mpeg",
     ".m2ts", ".mts", ".ts", ".vob", ".3gp", ".ogv", ".divx", ".xvid", ".rm", ".rmvb", ".f4v",
@@ -435,9 +437,14 @@ def main():
         return r, None
 
     a.cache.parent.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(a.jobs) as pool, open(a.cache, "a") as cf:
+    bar = tqdm(total=len(files), initial=n_cached, unit="file", dynamic_ncols=True, colour="green",
+               desc="deep" if a.deep else "probe", smoothing=0.05,
+               bar_format="{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                          "[{elapsed}<{remaining}, {rate_fmt}{postfix}]")
+    bar.set_postfix_str(f"cached {n_cached}, errors 0")
+    with bar, ThreadPoolExecutor(a.jobs) as pool, open(a.cache, "a") as cf:
         futs = {pool.submit(work, f, key, cached): (f, key) for f, key, cached in todo}
-        for i, fut in enumerate(as_completed(futs), 1):
+        for fut in as_completed(futs):
             f, key = futs[fut]
             try:
                 r, err = fut.result()
@@ -448,8 +455,8 @@ def main():
                     errors.append((f, err))
             except Exception as e:  # keep going on corrupt/odd files
                 errors.append((f, str(e)))
-            if i % 100 == 0:
-                print(f"  analyzed {i}/{len(todo)}", file=sys.stderr)
+            bar.set_postfix_str(f"cached {n_cached}, errors {len(errors)} · {f.name[:40]}", refresh=False)
+            bar.update()
 
     tier_rank = {n: i for i, (n, _) in enumerate(RES_TIERS)}
     grade_rank = {n: i for i, (n, _) in enumerate(GRADES)}

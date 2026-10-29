@@ -12,7 +12,7 @@ File size is misleading: old codecs (Xvid, MPEG-2) need far more data for the sa
 | ffmpeg (`ffprobe`, `ffmpeg`) | metadata probing and frame sampling |
 | C compiler, `make`, `bash`, access to github.com (optional) | to build [resdet](https://github.com/0x09/resdet) automatically on the first `--deep` run (`sudo apt install build-essential`). No `pkg-config` or extra libraries needed. If the build fails, the warning names the failing step and the full log is in `<venv>/resdet-build.log` |
 
-There are no Python package dependencies.
+The only Python dependency is `tqdm` (progress bar), installed automatically by uv. The progress bar shows percent, ETA, files per second, how many came from the cache, the error count, and the file just finished.
 
 ## Run
 
