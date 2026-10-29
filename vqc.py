@@ -48,9 +48,9 @@ CODEC_EFFICIENCY = {
 }
 DEFAULT_EFFICIENCY = 0.6
 
-# (name, min short side, min long side) - either threshold qualifies; handles 1920x800 crops.
-RES_TIERS = [("2160p", 1800, 3200), ("1440p", 1200, 2200), ("1080p", 900, 1600),
-             ("720p", 600, 1200), ("480p", 400, 640), ("low", 0, 0)]
+# (name, min 16:9-equivalent height = sqrt(w*h*9/16)). Pixel count is orientation/aspect neutral:
+# 1920x800 scope -> 929 (1080p), 1080x2400 phone -> 1207 (1080p), 720x1600 phone -> 805 (720p).
+RES_TIERS = [("2160p", 1800), ("1440p", 1300), ("1080p", 860), ("720p", 580), ("480p", 400), ("low", 0)]
 # Thresholds on norm_bpp (H.264-equivalent at 1080p).
 GRADES = [("excellent", 0.15), ("good", 0.08), ("fair", 0.04), ("poor", 0.0)]
 REF_PIXELS = 1920 * 1080
@@ -99,8 +99,16 @@ def _tag_bitrate(stream):
 
 
 def tier_of(w, h):
-    short, long_ = min(w, h), max(w, h)
-    return next(n for n, s, l in RES_TIERS if short >= s or (l and long_ >= l))
+    eq_h = (w * h * 9 / 16) ** 0.5
+    return next(n for n, t in RES_TIERS if eq_h >= t)
+
+
+def _rotation(v):
+    """Display rotation in degrees counter-clockwise (phones store portrait video as rotated landscape)."""
+    for sd in v.get("side_data_list") or []:
+        if "rotation" in sd:
+            return int(round(float(sd["rotation"]))) % 360
+    return -int((v.get("tags") or {}).get("rotate", 0)) % 360
 
 
 def analyze(path):
@@ -151,7 +159,8 @@ def analyze(path):
         "width": w, "height": h, "fps": round(fps, 3), "video_kbps": round(vbr / 1000),
         "bitrate_src": src, "bit_depth": 10 if "10" in pix or "12" in pix else 8,
         "hdr": hdr, "duration_min": round(duration / 60, 1) if duration else "",
-        "size_mb": round(size / 2**20, 1), "_duration_s": duration or 0, "_vstream": v.get("index", 0),
+        "size_mb": round(size / 2**20, 1), "rotation": _rotation(v),
+        "_duration_s": duration or 0, "_vstream": v.get("index", 0),
     }
 
 
@@ -202,8 +211,13 @@ def _resdet_height(resdet, y4m, h):
     return best[0] if best else None
 
 
+SNAP_H, SNAP_CROP_W = 270, 480
+TRANSPOSE = {90: "transpose=cclock,", 180: "hflip,vflip,", 270: "transpose=clock,"}
+
+
 def deep_analyze(row, n_frames, resdet, snap):
-    """snap: JPEG path where the deciding sampled frame is saved (reuses the decoded frames)."""
+    """snap: JPEG path for a strip of the deciding sampled frame: whole frame scaled down | 1:1 centre crop
+    (shows real sharpness). Reuses the already decoded frames."""
     w, h = row["width"], row["height"]
     # The 2nd most detailed frame decides, so a few flat/black frames can't make a sharp video look soft.
     pick_i = lambda vals: sorted(range(len(vals)), key=vals.__getitem__)[min(1, len(vals) - 1)]
@@ -214,14 +228,19 @@ def deep_analyze(row, n_frames, resdet, snap):
         per_scale = _roundtrip_ssim(y4m, w, h, tmp)
         rd_h = _resdet_height(resdet, y4m, h) if resdet else None
         i = pick_i(per_scale[0]) if per_scale[0] else 0
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", y4m, "-vf", f"select=eq(n\\,{i})", "-frames:v", "1",
+        sh = f"min({SNAP_H}\\,ih)"
+        vf = (f"select=eq(n\\,{i}),{TRANSPOSE.get(row.get('rotation', 0), '')}split[a][b];"
+              f"[a]scale=-2:'{sh}':flags=area[t];[b]crop='min({SNAP_CROP_W}\\,iw)':'{sh}',pad=iw+6:ih:6:0:white[c];"
+              "[t][c]hstack")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", y4m, "-filter_complex", vf, "-frames:v", "1",
                         "-q:v", "3", str(snap)], check=True, capture_output=True, timeout=120)
     eff = 1.0
     for (k, thr), vals in zip(DEEP_SCALES, per_scale):
         if not vals or pick(vals) < thr:
             break
         eff = k
-    eff_h = min(rd_h, round(h * eff)) if rd_h else round(h * eff)
+    # resdet's exact source height wins; SSIM's coarse estimate can read flat/bokeh content as too soft.
+    eff_h = rd_h or round(h * eff)
     return {
         "detail": round(1 - pick(per_scale[0]), 4) if per_scale[0] else "",
         "ssim_eff_height": round(h * eff), "resdet_height": rd_h or "",
@@ -265,18 +284,19 @@ def write_report(path, root, groups, errors, options, snaps):
     for g, rs in groups.items():
         out.append(f"| {g} | {len(rs)} | {sum(r['size_mb'] for r in rs) / 1024:.1f} |")
     deep = snaps is not None
-    head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] + (["eff. height", "detail", "snapshot"] if deep else []) \
+    head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] + (["effective", "detail", "snapshot"] if deep else []) \
         + ["min", "MB"]
     for g, rs in groups.items():
         out += ["", f"## {g}", "", "| " + " | ".join(head) + " |",
                 "|---|---|---|--:|--:|" + ("--:|--:|---|" if deep else "") + "--:|--:|"]
         for r in rs:
-            cells = [_md(os.path.relpath(r["path"], root)), f"{r['width']}x{r['height']}", r["codec"],
+            dw, dh = _display_size(r)
+            cells = [_md(os.path.relpath(r["path"], root)), f"{dw}x{dh}", r["codec"],
                      f"{r['video_kbps'] / 1000:.1f}", r["norm_bpp"]]
             if deep:
-                img, t = f"{snaps}/{r.get('snapshot', '')}", r.get("snapshot_t", 0)
-                cells += [r.get("eff_height", ""), r.get("detail", ""),
-                          f'<a href="{img}"><img src="{img}" width="240" title="at {t // 60}:{t % 60:02d}"></a>'
+                f, t = r.get("eff_height", 0) / r["height"], r.get("snapshot_t", 0)
+                cells += [f"{round(dw * f)}x{round(dh * f)}" if f else "", r.get("detail", ""),
+                          f'![frame at {t // 60}:{t % 60:02d}]({snaps}/{r["snapshot"]} "frame at {t // 60}:{t % 60:02d}")'
                           if r.get("snapshot") else ""]
             cells += [r["duration_min"], round(r["size_mb"])]
             out.append("| " + " | ".join(str(c) for c in cells) + " |")
@@ -286,16 +306,31 @@ def write_report(path, root, groups, errors, options, snaps):
     Path(path).write_text("\n".join(out) + "\n")
 
 
-def link_snapshots(report, snap_dir):
-    """VS Code's Markdown preview only loads images under the workspace or the report's folder,
-    so a symlink next to the report points into the cache instead of copying the JPEGs."""
-    link = Path(report).resolve().parent / "vqc_snapshots"
-    if link.is_symlink():
-        link.unlink()
-    if link.exists():  # a real folder of that name: leave it alone and link to the cache directly
-        return snap_dir.as_posix()
-    link.symlink_to(snap_dir, target_is_directory=True)
-    return link.name
+def snap_name(key):
+    return hashlib.sha1(key.encode()).hexdigest()[:16] + "_strip.jpg"
+
+
+def _display_size(r):
+    w, h = r["width"], r["height"]
+    return (h, w) if r.get("rotation", 0) in (90, 270) else (w, h)
+
+
+def link_snapshots(report, snap_dir, rows):
+    """Markdown previews (e.g. VS Code) only load images under the workspace or the report's folder, so
+    each snapshot used by the report is symlinked into vqc_snapshots/ next to it; the JPEGs stay in the cache."""
+    d = Path(report).resolve().parent / "vqc_snapshots"
+    if d.is_symlink():  # older vqc versions linked the whole folder
+        d.unlink()
+    d.mkdir(exist_ok=True)
+    for r in rows:
+        if r.get("snapshot"):
+            link, target = d / r["snapshot"], snap_dir / r["snapshot"]
+            if link.is_symlink() or link.exists():
+                if link.is_symlink() and os.readlink(link) == str(target):
+                    continue
+                link.unlink()
+            link.symlink_to(target)
+    return d.name
 
 
 def in_uv_venv():
@@ -381,7 +416,9 @@ def main():
         st = f.stat()
         key = f"{f}|{st.st_size}|{int(st.st_mtime)}"
         cached = {k: v for k, v in cache[key].items() if k != "_key"} if key in cache else None
-        if cached and (not a.deep or (snap_dir / cached.get("snapshot", "-")).is_file()):
+        if cached and "rotation" not in cached:  # from an older vqc version
+            cached = None
+        if cached and (not a.deep or (cached.get("snapshot") == snap_name(key) and (snap_dir / snap_name(key)).is_file())):
             rows.append(cached)
         else:
             todo.append((f, key, cached))
@@ -391,7 +428,7 @@ def main():
         r = cached or analyze(f)
         if a.deep:
             try:
-                snap = snap_dir / (hashlib.sha1(key.encode()).hexdigest()[:16] + ".jpg")
+                snap = snap_dir / snap_name(key)
                 r = {**r, **deep_analyze(r, a.frames, a.resdet, snap)}
             except Exception as e:  # keep the metadata result if frame sampling fails
                 return r, f"deep: {e}"
@@ -414,9 +451,13 @@ def main():
             if i % 100 == 0:
                 print(f"  analyzed {i}/{len(todo)}", file=sys.stderr)
 
-    tier_rank = {n: i for i, (n, _, _) in enumerate(RES_TIERS)}
+    tier_rank = {n: i for i, (n, _) in enumerate(RES_TIERS)}
     grade_rank = {n: i for i, (n, _) in enumerate(GRADES)}
     # Without --deep, ignore deep results that may be in the cache so the report matches the options.
+    for r in rows:  # recompute so cached rows follow the current tier rules
+        r["tier"] = tier_of(r["width"], r["height"])
+        if r.get("eff_height"):
+            r["eff_tier"] = tier_of(round(r["width"] * r["eff_height"] / r["height"]), r["eff_height"])
     tier = lambda r: (a.deep and r.get("eff_tier")) or r["tier"]
     rows.sort(key=lambda r: (tier_rank[tier(r)], grade_rank[r["grade"]], -r["norm_bpp"]))
     groups = defaultdict(list)
@@ -432,7 +473,7 @@ def main():
         ("files", f"{len(files)} found: {n_cached} from cache, {len(todo)} analyzed now, {len(errors)} with errors"),
         ("cache", f"`{a.cache}`"),
     ] + ([("snapshots", f"`{snap_dir}`")] if a.deep else [])
-    write_report(a.report, root, groups, errors, options, link_snapshots(a.report, snap_dir) if a.deep else None)
+    write_report(a.report, root, groups, errors, options, link_snapshots(a.report, snap_dir, rows) if a.deep else None)
 
     print(f"\n{'group':<18}{'files':>7}{'size GB':>10}")
     for g, rs in groups.items():

@@ -56,15 +56,29 @@ Each file gets a **group** `<tier>/<grade>`, e.g. `1080p/good`. The same group s
 
 | term / column | meaning |
 |---|---|
-| tier | resolution: `2160p` `1440p` `1080p` `720p` `480p` `low` (cropped widescreen like 1920x800 counts as 1080p); with `--deep`, the *effective* resolution |
+| tier | `2160p` `1440p` `1080p` `720p` `480p` `low`, from pixel count, so it works for any orientation and aspect ratio (see [Tiers](#tiers)); with `--deep`, from the *effective* resolution |
 | grade | from `norm bpp`: `excellent` ≥ 0.15, `good` ≥ 0.08, `fair` ≥ 0.04, `poor` below |
 | file | path relative to the library folder |
-| resolution, codec, Mb/s | from the video stream |
+| resolution | as displayed: phone videos stored rotated (iPhone) are shown upright, e.g. `1080x1920` |
+| codec, Mb/s | from the video stream |
 | norm bpp | bits per pixel (bitrate ÷ (width × height × fps)) × codec efficiency × (pixels / 1080p)^0.25, i.e. H.264-equivalent bpp at 1080p |
-| eff. height | `--deep`: real detail height, the lower of round-trip SSIM and resdet |
+| effective | `--deep`: resolution the picture really has: resdet's exact source size if it finds an upscale, otherwise the round-trip SSIM estimate |
 | detail | `--deep`: 1 − SSIM at 0.75× round trip; ~0.03–0.06 sharp 1080p camera footage, < ~0.015 upscaled/blurred |
-| snapshot | `--deep`: thumbnail of the sampled frame that decided the result; click for full resolution, hover for its timestamp |
+| snapshot | `--deep`: embedded image of the sampled frame that decided the result: the whole frame scaled down, next to a 1:1 centre crop at the video's own pixels (blur and upscaling are visible there). Hover for the timestamp |
 | min, MB | duration and file size |
+
+## Tiers
+
+The tier comes from the 16:9-equivalent height √(width × height × 9/16), so portrait, landscape, phone 20:9 and cinemascope crops are all judged by pixel count:
+
+| tier | equivalent height | examples (either orientation) |
+|---|---|---|
+| 2160p | ≥ 1800 | 3840x2160, 2160x3840 phone 4K, 3840x1600 |
+| 1440p | ≥ 1300 | 2560x1440, 1440x3200 / 1440x3088 (QHD+ phones), 1290x2796 |
+| 1080p | ≥ 860 | 1920x1080, 1080x1920, 1080x2400 / 1080x2340 (FHD+ phones), 1170x2532, 1920x800, 1440x1080 |
+| 720p | ≥ 580 | 1280x720, 720x1280, 720x1600 (HD+ phones), 750x1334, 1280x536 |
+| 480p | ≥ 400 | 854x480, 640x480, 720x576, 540x960, 576x1024 |
+| low | below | 640x360, 360x640 |
 
 ## How quality is measured
 
@@ -85,7 +99,7 @@ Codec factors, grade thresholds and `--deep` thresholds (`DEEP_SCALES`) are cons
 | location | `~/.cache/vqc/cache.jsonl` (`$XDG_CACHE_HOME/vqc/` if set); override with `--cache` |
 | key | absolute path + size + modification time, so one cache serves all your libraries |
 | reuse | unchanged files are skipped; metadata-only results are upgraded when you later run `--deep`; a run without `--deep` ignores cached deep results |
-| snapshots | `--deep` saves the deciding frame (full-res JPEG, ~100–400 KB) to `snapshots/` next to the cache. The report links them through a `vqc_snapshots` symlink beside it, so nothing is copied (VS Code's Markdown preview only loads images under the workspace or the report's folder) |
+| snapshots | `--deep` saves one small JPEG strip per file (~10–60 KB) to `snapshots/` next to the cache. The report embeds them from a `vqc_snapshots/` folder beside it that holds only symlinks into the cache, so nothing is copied (Markdown previews such as VS Code's only load images under the workspace or the report's folder) |
 | reset | delete the `vqc` cache folder |
 
 ## Accuracy
