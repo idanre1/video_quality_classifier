@@ -79,6 +79,7 @@ The grade comes from `norm bpp`: bits per pixel (bitrate ÷ (width × height × 
 | file already has a vqc prefix | the old prefix is replaced, never stacked; reruns only touch files whose quality changed |
 | subtitles / sidecars with the same name (`Movie.srt`, `Movie.en.srt`, `Movie.nfo`) | renamed together with the video, so players still find them |
 | new name already taken | file skipped, listed under **Errors** in the report |
+| file can't be renamed (open in another program, name too long) | the video and its sidecars are left unchanged, listed under **Errors**; rerun `--rename` later |
 | cache | follows the rename, so nothing is analyzed again |
 
 ## Undo

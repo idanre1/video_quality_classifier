@@ -129,6 +129,16 @@ resdet found all 12 upscales at the exact height, with no false positives on the
 | AI upscalers (Topaz etc.), grain added after upscaling | can hide an upscale from both checks |
 | synthetic graphics (test patterns, screen recordings) | can mislead resdet |
 
+## WSL / Windows network drive
+
+| topic | what to do |
+|---|---|
+| mount a mapped drive | `/etc/fstab`: `Z: /mnt/z drvfs defaults,uid=1000,gid=1000 0 0` (or `sudo mount -t drvfs '\\server\share' /mnt/z`, no drive letter needed). `metadata` is not needed |
+| `/mnt/z` empty | Windows had not reconnected Z: when WSL started; check `mount \| grep /mnt/z` and mount again |
+| `rename failed … Is it open in another program?` | Windows can't rename open files (player, Explorer preview, antivirus, another PC). The file and its sidecars are left unchanged and listed under Errors; close it and rerun `--rename` |
+| report on the share | symlinks are not possible there, so `vqc_snapshots/` gets small copies of the JPEGs instead |
+| speed | ffprobe/ffmpeg read over the network; keep the cache on the Linux side (default) |
+
 ## Other tools considered
 
 Tested on the same clips before choosing the `--deep` method ([overview](https://www.forasoft.com/learn/video-quality/articles-vqm/open-source-no-reference-tools)):
