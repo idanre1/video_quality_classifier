@@ -48,7 +48,8 @@ Each file gets a **group** `<tier>/<grade>`, e.g. `1080p/good`. The same group s
 
 | section | content |
 |---|---|
-| header | library path, file count, total size, mode, date |
+| header | library path, file count, total size, date |
+| Options | the exact command, mode (**deep** with frames + resdet path, or **metadata only**), extensions, files found / from cache / analyzed now / errors, cache and snapshot paths |
 | Summary | one row per group: files, size GB (best groups first) |
 | one section per group | table of its files, best `norm bpp` first |
 | Errors | files that couldn't be read, with the reason (only if any) |
@@ -62,6 +63,7 @@ Each file gets a **group** `<tier>/<grade>`, e.g. `1080p/good`. The same group s
 | norm bpp | bits per pixel (bitrate ÷ (width × height × fps)) × codec efficiency × (pixels / 1080p)^0.25, i.e. H.264-equivalent bpp at 1080p |
 | eff. height | `--deep`: real detail height, the lower of round-trip SSIM and resdet |
 | detail | `--deep`: 1 − SSIM at 0.75× round trip; ~0.03–0.06 sharp 1080p camera footage, < ~0.015 upscaled/blurred |
+| snapshot | `--deep`: thumbnail of the sampled frame that decided the result; click for full resolution, hover for its timestamp |
 | min, MB | duration and file size |
 
 ## How quality is measured
@@ -82,8 +84,9 @@ Codec factors, grade thresholds and `--deep` thresholds (`DEEP_SCALES`) are cons
 |---|---|
 | location | `~/.cache/vqc/cache.jsonl` (`$XDG_CACHE_HOME/vqc/` if set); override with `--cache` |
 | key | absolute path + size + modification time, so one cache serves all your libraries |
-| reuse | unchanged files are skipped; metadata-only results are upgraded when you later run `--deep` |
-| reset | delete the file |
+| reuse | unchanged files are skipped; metadata-only results are upgraded when you later run `--deep`; a run without `--deep` ignores cached deep results |
+| snapshots | `--deep` saves the deciding frame (full-res JPEG, ~100–400 KB) to `snapshots/` next to the cache. The report links them through a `vqc_snapshots` symlink beside it, so nothing is copied (VS Code's Markdown preview only loads images under the workspace or the report's folder) |
+| reset | delete the `vqc` cache folder |
 
 ## Accuracy
 

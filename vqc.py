@@ -15,10 +15,12 @@ blurry or upscaled files are grouped by the detail they really contain:
     exact source height of upscales.
 """
 import argparse
+import hashlib
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -164,6 +166,7 @@ def _sample_frames(path, row, n, y4m):
     fc = chains + "".join(f"[v{i}]" for i in range(len(times))) + f"concat=n={len(times)}:v=1:a=0[out]"
     subprocess.run(cmd + ["-filter_complex", fc, "-map", "[out]", "-f", "yuv4mpegpipe", y4m],
                    check=True, capture_output=True, timeout=600)
+    return times
 
 
 def _roundtrip_ssim(y4m, w, h, tmp):
@@ -199,15 +202,20 @@ def _resdet_height(resdet, y4m, h):
     return best[0] if best else None
 
 
-def deep_analyze(row, n_frames, resdet):
+def deep_analyze(row, n_frames, resdet, snap):
+    """snap: JPEG path where the deciding sampled frame is saved (reuses the decoded frames)."""
     w, h = row["width"], row["height"]
+    # The 2nd most detailed frame decides, so a few flat/black frames can't make a sharp video look soft.
+    pick_i = lambda vals: sorted(range(len(vals)), key=vals.__getitem__)[min(1, len(vals) - 1)]
+    pick = lambda vals: vals[pick_i(vals)]
     with tempfile.TemporaryDirectory(prefix="vqc_") as tmp:
         y4m = f"{tmp}/s.y4m"
-        _sample_frames(row["path"], row, n_frames, y4m)
+        times = _sample_frames(row["path"], row, n_frames, y4m)
         per_scale = _roundtrip_ssim(y4m, w, h, tmp)
         rd_h = _resdet_height(resdet, y4m, h) if resdet else None
-    # The 2nd most detailed frame decides, so a few flat/black frames can't make a sharp video look soft.
-    pick = lambda vals: sorted(vals)[min(1, len(vals) - 1)]
+        i = pick_i(per_scale[0]) if per_scale[0] else 0
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", y4m, "-vf", f"select=eq(n\\,{i})", "-frames:v", "1",
+                        "-q:v", "3", str(snap)], check=True, capture_output=True, timeout=120)
     eff = 1.0
     for (k, thr), vals in zip(DEEP_SCALES, per_scale):
         if not vals or pick(vals) < thr:
@@ -218,6 +226,7 @@ def deep_analyze(row, n_frames, resdet):
         "detail": round(1 - pick(per_scale[0]), 4) if per_scale[0] else "",
         "ssim_eff_height": round(h * eff), "resdet_height": rd_h or "",
         "eff_height": eff_h, "eff_tier": tier_of(round(w * eff_h / h), eff_h),
+        "snapshot": Path(snap).name, "snapshot_t": round(times[min(i, len(times) - 1)]),
     }
 
 
@@ -244,32 +253,49 @@ def _md(text):
     return re.sub(r"([\\`*_\[\]<>|#])", r"\\\1", str(text))
 
 
-def write_report(path, root, groups, errors, deep):
-    """Markdown report: summary per group, then one table per group (best norm_bpp first)."""
+def write_report(path, root, groups, errors, options, snaps):
+    """Markdown report: options, summary per group, then one table per group (best norm_bpp first).
+    snaps: folder (relative to the report) holding --deep snapshots, or None."""
     total = sum(len(rs) for rs in groups.values())
     gb = sum(r["size_mb"] for rs in groups.values() for r in rs) / 1024
-    out = ["# Video quality report", "",
-           f"`{root}` · {total} files · {gb:.1f} GB · {'deep' if deep else 'metadata'} mode · "
-           f"{time.strftime('%Y-%m-%d %H:%M')}", "",
-           "## Summary", "", "| group | files | size GB |", "|---|--:|--:|"]
+    out = ["# Video quality report", "", f"`{root}` · {total} files · {gb:.1f} GB · {time.strftime('%Y-%m-%d %H:%M')}",
+           "", "## Options", "", "| option | value |", "|---|---|"]
+    out += [f"| {k} | {v} |" for k, v in options]
+    out += ["", "## Summary", "", "| group | files | size GB |", "|---|--:|--:|"]
     for g, rs in groups.items():
         out.append(f"| {g} | {len(rs)} | {sum(r['size_mb'] for r in rs) / 1024:.1f} |")
-    head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] + (["eff. height", "detail"] if deep else []) \
+    deep = snaps is not None
+    head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] + (["eff. height", "detail", "snapshot"] if deep else []) \
         + ["min", "MB"]
     for g, rs in groups.items():
         out += ["", f"## {g}", "", "| " + " | ".join(head) + " |",
-                "|---|---|---|--:|--:|" + ("--:|--:|" if deep else "") + "--:|--:|"]
+                "|---|---|---|--:|--:|" + ("--:|--:|---|" if deep else "") + "--:|--:|"]
         for r in rs:
             cells = [_md(os.path.relpath(r["path"], root)), f"{r['width']}x{r['height']}", r["codec"],
                      f"{r['video_kbps'] / 1000:.1f}", r["norm_bpp"]]
             if deep:
-                cells += [r.get("eff_height", ""), r.get("detail", "")]
+                img, t = f"{snaps}/{r.get('snapshot', '')}", r.get("snapshot_t", 0)
+                cells += [r.get("eff_height", ""), r.get("detail", ""),
+                          f'<a href="{img}"><img src="{img}" width="240" title="at {t // 60}:{t % 60:02d}"></a>'
+                          if r.get("snapshot") else ""]
             cells += [r["duration_min"], round(r["size_mb"])]
             out.append("| " + " | ".join(str(c) for c in cells) + " |")
     if errors:
         out += ["", "## Errors", "", "| file | error |", "|---|---|"]
         out += [f"| {_md(os.path.relpath(f, root))} | {_md(str(e).replace(f'{f}: ', ''))} |" for f, e in errors]
     Path(path).write_text("\n".join(out) + "\n")
+
+
+def link_snapshots(report, snap_dir):
+    """VS Code's Markdown preview only loads images under the workspace or the report's folder,
+    so a symlink next to the report points into the cache instead of copying the JPEGs."""
+    link = Path(report).resolve().parent / "vqc_snapshots"
+    if link.is_symlink():
+        link.unlink()
+    if link.exists():  # a real folder of that name: leave it alone and link to the cache directly
+        return snap_dir.as_posix()
+    link.symlink_to(snap_dir, target_is_directory=True)
+    return link.name
 
 
 def in_uv_venv():
@@ -323,7 +349,10 @@ def main():
                  "  or install once:  uv tool install /path/to/video_quality_classifier  ->  vqc /path/to/library ...")
     if a.resdet and not shutil.which(a.resdet):
         ap.error(f"--resdet {a.resdet}: not found or not executable")
+    a.cache = a.cache.resolve()
+    snap_dir = a.cache.parent / "snapshots"
     if a.deep:
+        snap_dir.mkdir(parents=True, exist_ok=True)
         a.resdet = a.resdet or ensure_resdet()
         if a.resdet:
             print(f"resdet: {a.resdet}", file=sys.stderr)
@@ -338,23 +367,25 @@ def main():
         st = f.stat()
         key = f"{f}|{st.st_size}|{int(st.st_mtime)}"
         cached = {k: v for k, v in cache[key].items() if k != "_key"} if key in cache else None
-        if cached and (not a.deep or "eff_height" in cached):
+        if cached and (not a.deep or (snap_dir / cached.get("snapshot", "-")).is_file()):
             rows.append(cached)
         else:
             todo.append((f, key, cached))
+    n_cached = len(rows)
 
-    def work(f, cached):
+    def work(f, key, cached):
         r = cached or analyze(f)
         if a.deep:
             try:
-                r = {**r, **deep_analyze(r, a.frames, a.resdet)}
+                snap = snap_dir / (hashlib.sha1(key.encode()).hexdigest()[:16] + ".jpg")
+                r = {**r, **deep_analyze(r, a.frames, a.resdet, snap)}
             except Exception as e:  # keep the metadata result if frame sampling fails
                 return r, f"deep: {e}"
         return r, None
 
     a.cache.parent.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(a.jobs) as pool, open(a.cache, "a") as cf:
-        futs = {pool.submit(work, f, cached): (f, key) for f, key, cached in todo}
+        futs = {pool.submit(work, f, key, cached): (f, key) for f, key, cached in todo}
         for i, fut in enumerate(as_completed(futs), 1):
             f, key = futs[fut]
             try:
@@ -371,13 +402,23 @@ def main():
 
     tier_rank = {n: i for i, (n, _, _) in enumerate(RES_TIERS)}
     grade_rank = {n: i for i, (n, _) in enumerate(GRADES)}
-    tier = lambda r: r.get("eff_tier") or r["tier"]
+    # Without --deep, ignore deep results that may be in the cache so the report matches the options.
+    tier = lambda r: (a.deep and r.get("eff_tier")) or r["tier"]
     rows.sort(key=lambda r: (tier_rank[tier(r)], grade_rank[r["grade"]], -r["norm_bpp"]))
     groups = defaultdict(list)
     for r in rows:
         r["group"] = f"{tier(r)}/{r['grade']}"
         groups[r["group"]].append(r)
-    write_report(a.report, root, groups, errors, a.deep)
+    options = [
+        ("command", f"`vqc {shlex.join(sys.argv[1:])}`"),
+        ("mode", f"**deep**: {a.frames} frames per file, round-trip SSIM + "
+                 + (f"resdet (`{a.resdet}`)" if a.resdet else "**no resdet** (SSIM only)")
+                 if a.deep else "**metadata only** (no `--deep`: upscaled/blurry files are not detected)"),
+        ("extensions", " ".join(sorted(exts)) if a.ext else f"default ({len(exts)} video types)"),
+        ("files", f"{len(files)} found: {n_cached} from cache, {len(todo)} analyzed now, {len(errors)} with errors"),
+        ("cache", f"`{a.cache}`"),
+    ] + ([("snapshots", f"`{snap_dir}`")] if a.deep else [])
+    write_report(a.report, root, groups, errors, options, link_snapshots(a.report, snap_dir) if a.deep else None)
 
     print(f"\n{'group':<18}{'files':>7}{'size GB':>10}")
     for g, rs in groups.items():
