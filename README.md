@@ -26,6 +26,7 @@ The only Python dependency is `tqdm` (progress bar), installed automatically by 
 uv run vqc /lib                        # metadata only -> video_quality.md
 uv run vqc /lib --deep                 # also detect blurry / upscaled files
 uv run vqc /lib --deep -o ~/lib.md     # report somewhere else
+uv run vqc /lib --deep --rename        # rename files best-first: 10_1080p-good_Movie.mkv
 ```
 
 ## Flags
@@ -39,6 +40,7 @@ uv run vqc /lib --deep -o ~/lib.md     # report somewhere else
 | `--ext LIST` | common video types | only these extensions, e.g. `mkv,mp4` |
 | `--deep` | off | sample frames to measure effective resolution; groups use it instead of the nominal one |
 | `--frames N` | 8 | frames sampled per file with `--deep` |
+| `--rename` | off | prefix each file (and its subtitles/sidecars) with its quality rank so an A→Z sort lists the best first, e.g. `10_1080p-good_Movie.mkv`; writes `vqc_undo_rename.sh` next to the report. Codes explained in [QUALITY_CODES.md](QUALITY_CODES.md) |
 | `--resdet PATH` | `<venv>/bin/resdet` | use this resdet binary instead of the auto-built one; a wrong path is an error |
 | `-h`, `--help` | — | show help (works without uv) |
 
