@@ -82,6 +82,14 @@ This prevents resizing traces from overriding severe detail loss caused by later
 
 ## 5. Picture statistics: noise and diagnostic flags
 
+These checks are implemented locally with **NumPy**; ffmpeg decodes the sampled frames, while neither resdet nor an AI model computes these statistics.
+
+- **Noise / grain:** the Immerkaer high-pass filter estimates noise strength in the lowest-noise 10% of eligible 32-pixel blocks to reduce contamination from scene detail.
+- **Darkness:** the mean Y/luma value measures the centre crop's average brightness.
+- **Crushed blacks:** the fraction of Y/luma values at or below 18 measures how much of the centre crop is near black.
+- **Clipped highlights:** the fraction of Y/luma values at or above 233 measures how much of the centre crop is near white.
+- **Saturation:** the mean of `sqrt((U - 128)^2 + (V - 128)^2)` measures chroma strength relative to neutral colour.
+
 Values are combined using the median over sampled frames. Noise is estimated with the Immerkaer filter on 32-pixel blocks; the flattest 10% of eligible blocks reduce contamination by scene detail. Heavily clipped or too-small regions can leave noise unavailable.
 
 | Check | Condition | Scoring effect |
