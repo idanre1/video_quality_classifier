@@ -5,6 +5,7 @@ description = "Group a video library by real quality (bits per pixel, codec, eff
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "numpy>=2.0.2",
     "tqdm>=4.70.1",
 ]
 

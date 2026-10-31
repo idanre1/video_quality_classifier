@@ -13,6 +13,8 @@ blurry or upscaled files are grouped by the detail they really contain:
     the frame holds no detail above k * height (catches upscales, soft focus, heavy blur).
   * resdet (https://github.com/0x09/resdet, auto-built into the uv venv on first --deep run):
     exact source height of upscales.
+  * picture stats: noise (heavy noise/grain lowers the grade one step), brightness, clipping and
+    saturation, reported as flags.
 """
 import argparse
 import errno
@@ -33,6 +35,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
 from tqdm import tqdm
 
 VIDEO_EXTS = {
@@ -66,6 +69,13 @@ DEEP_SCALES = [(0.75, 0.98), (0.5, 0.985), (0.333, 0.95)]
 DEEP_CROP = (0.7, 0.6)  # centre crop (w, h fractions) so letterbox/pillarbox bars don't dilute SSIM
 # resdet reports DCT/compression artifacts at 6/8 and 7/8 of the height; ignore those unless strong.
 RESDET_ARTIFACT_FRACS, RESDET_ARTIFACT_MIN_CONF = (6 / 8, 7 / 8), 0.66
+# resdet only sees resampling, not blur/denoise/blocking added later: if SSIM finds far less detail
+# than resdet's source height (below this fraction), the picture was degraded further and SSIM wins.
+RESDET_TRUST = 0.6
+# Picture stats from the sampled frames (8-bit luma, centre crop). Noise = Immerkaer estimate on the
+# flattest 10% of 32px blocks: native footage measured 0-1.1, heavy grain 9-10.
+NOISE_NOISY, NOISE_HEAVY = 3.5, 5.0  # flag "noisy"; heavy noise also drops the grade one step
+DARK_LUMA, CRUSH_FRAC, CLIP_FRAC, SAT_HIGH = 32, 0.15, 0.05, 30
 RESDET_VERSION = "2.4.4"
 RESDET_URL = f"https://github.com/0x09/resdet/archive/refs/tags/{RESDET_VERSION}.tar.gz"
 # Keys are absolute path + size + mtime, so one cache serves every library.
@@ -214,6 +224,76 @@ def _resdet_height(resdet, y4m, h):
     return best[0] if best else None
 
 
+def _y4m_frames(y4m):
+    """Yield (Y, U, V) uint8 planes of each frame of a 4:2:0 y4m file."""
+    data = Path(y4m).read_bytes()
+    head, pos = data[:data.index(b"\n")].split(), data.index(b"\n") + 1
+    w = int(next(t[1:] for t in head if t.startswith(b"W")))
+    h = int(next(t[1:] for t in head if t.startswith(b"H")))
+    cw, ch = (w + 1) // 2, (h + 1) // 2
+    while pos < len(data):
+        pos = data.index(b"\n", pos) + 1  # FRAME header
+        y = np.frombuffer(data, np.uint8, w * h, pos).reshape(h, w)
+        u = np.frombuffer(data, np.uint8, cw * ch, pos + w * h).reshape(ch, cw)
+        v = np.frombuffer(data, np.uint8, cw * ch, pos + w * h + cw * ch).reshape(ch, cw)
+        pos += w * h + 2 * cw * ch
+        yield y, u, v
+
+
+def _noise_sigma(y, b=32):
+    """Immerkaer fast noise estimate per block; the flattest 10% of unclipped blocks hold mostly noise,
+    not picture detail."""
+    f = y.astype(np.float32)
+    lap = (f[:-2, :-2] + f[:-2, 2:] + f[2:, :-2] + f[2:, 2:]
+           - 2 * (f[:-2, 1:-1] + f[1:-1, :-2] + f[1:-1, 2:] + f[2:, 1:-1]) + 4 * f[1:-1, 1:-1])
+    h, w = lap.shape[0] // b * b, lap.shape[1] // b * b
+    if not h or not w:
+        return None
+    blocks = lambda a: a[:h, :w].reshape(h // b, b, w // b, b).sum(axis=(1, 3)).ravel()
+    inner = y[1:-1, 1:-1]
+    live = ((inner > 1) & (inner < 254)).astype(np.float32)  # clipped pixels hide noise: skip them
+    n = blocks(live)
+    keep = n >= b * b / 2
+    sig = blocks(np.abs(lap) * live)[keep] / n[keep] * np.sqrt(np.pi / 2) / 6
+    ok = sig
+    if ok.size < max(4, sig.size // 20):
+        return None
+    ok.sort()
+    return float(ok[:max(1, ok.size // 10)].mean())
+
+
+def _picture_stats(y4m):
+    """Median over sampled frames of noise, mean luma, crushed/clipped fractions and saturation."""
+    stats = []
+    for y, u, v in _y4m_frames(y4m):
+        h, w = y.shape
+        y0, x0 = int(h * (1 - DEEP_CROP[1]) / 2), int(w * (1 - DEEP_CROP[0]) / 2)
+        yc = y[y0:h - y0, x0:w - x0]
+        uc, vc = (p[y0 // 2:(h - y0) // 2, x0 // 2:(w - x0) // 2].astype(np.float32) - 128 for p in (u, v))
+        stats.append((_noise_sigma(yc), float(yc.mean()), float((yc <= 18).mean()), float((yc >= 233).mean()),
+                      float(np.hypot(uc, vc).mean())))
+    med = lambda i: (float(np.median(vals)) if (vals := [s[i] for s in stats if s[i] is not None]) else None)
+    noise = med(0)
+    return {"noise": round(noise, 2) if noise is not None else "", "luma": round(med(1), 1),
+            "crushed": round(med(2), 3), "clipped": round(med(3), 3), "saturation": round(med(4), 1)}
+
+
+def combine_height(ssim_h, rd_h):
+    if rd_h and ssim_h < RESDET_TRUST * rd_h:
+        return ssim_h
+    return rd_h or ssim_h
+
+
+def picture_flags(r):
+    n = r.get("noise")
+    flags = [("very noisy" if n >= NOISE_HEAVY else "noisy")] if n != "" and n is not None and n >= NOISE_NOISY else []
+    flags += ["dark"] if r.get("luma", 255) < DARK_LUMA else []
+    flags += ["crushed blacks"] if r.get("crushed", 0) >= CRUSH_FRAC else []
+    flags += ["clipped highlights"] if r.get("clipped", 0) >= CLIP_FRAC else []
+    flags += ["saturated"] if r.get("saturation", 0) >= SAT_HIGH else []
+    return flags
+
+
 SNAP_H, SNAP_CROP_W = 270, 480
 TRANSPOSE = {90: "transpose=cclock,", 180: "hflip,vflip,", 270: "transpose=clock,"}
 
@@ -230,6 +310,7 @@ def deep_analyze(row, n_frames, resdet, snap):
         times = _sample_frames(row["path"], row, n_frames, y4m)
         per_scale = _roundtrip_ssim(y4m, w, h, tmp)
         rd_h = _resdet_height(resdet, y4m, h) if resdet else None
+        stats = _picture_stats(y4m)
         i = pick_i(per_scale[0]) if per_scale[0] else 0
         sh = f"min({SNAP_H}\\,ih)"
         vf = (f"select=eq(n\\,{i}),{TRANSPOSE.get(row.get('rotation', 0), '')}split[a][b];"
@@ -242,9 +323,8 @@ def deep_analyze(row, n_frames, resdet, snap):
         if not vals or pick(vals) < thr:
             break
         eff = k
-    # resdet's exact source height wins; SSIM's coarse estimate can read flat/bokeh content as too soft.
-    eff_h = rd_h or round(h * eff)
-    return {
+    eff_h = combine_height(round(h * eff), rd_h)
+    return {**stats,
         "detail": round(1 - pick(per_scale[0]), 4) if per_scale[0] else "",
         "ssim_eff_height": round(h * eff), "resdet_height": rd_h or "",
         "eff_height": eff_h, "eff_tier": tier_of(round(w * eff_h / h), eff_h),
@@ -271,6 +351,20 @@ def load_cache(p):
     return cache
 
 
+def purge_cache(p, cache, files):
+    """Remove every cached version of scanned videos, including their earlier vqc names."""
+    unprefixed = lambda path: path.with_name(PREFIX_RE.sub("", path.name, count=1))
+    paths = {unprefixed(f) for f in files}
+    remaining = {key: row for key, row in cache.items()
+                 if unprefixed(Path(key.rsplit("|", 2)[0])) not in paths}
+    if len(remaining) != len(cache):
+        with tempfile.TemporaryDirectory(prefix="vqc_cache_", dir=p.parent) as tmp:
+            updated = Path(tmp, "cache.jsonl")
+            updated.write_text("".join(json.dumps(r) + "\n" for r in remaining.values()))
+            os.replace(updated, p)
+    return remaining
+
+
 def _md(text):
     return re.sub(r"([\\`*_\[\]<>|#])", r"\\\1", str(text))
 
@@ -287,18 +381,19 @@ def write_report(path, root, groups, errors, options, snaps):
     for g, rs in groups.items():
         out.append(f"| {g} | {len(rs)} | {sum(r['size_mb'] for r in rs) / 1024:.1f} |")
     deep = snaps is not None
-    head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] + (["effective", "detail", "snapshot"] if deep else []) \
-        + ["min", "MB"]
+    head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] \
+        + (["effective", "detail", "noise", "flags", "snapshot"] if deep else []) + ["min", "MB"]
     for g, rs in groups.items():
         out += ["", f"## {g}", "", "| " + " | ".join(head) + " |",
-                "|---|---|---|--:|--:|" + ("--:|--:|---|" if deep else "") + "--:|--:|"]
+                "|---|---|---|--:|--:|" + ("--:|--:|--:|---|---|" if deep else "") + "--:|--:|"]
         for r in rs:
             dw, dh = _display_size(r)
             cells = [_md(os.path.relpath(r["path"], root)), f"{dw}x{dh}", r["codec"],
                      f"{r['video_kbps'] / 1000:.1f}", r["norm_bpp"]]
             if deep:
                 f, t = r.get("eff_height", 0) / r["height"], r.get("snapshot_t", 0)
-                cells += [f"{round(dw * f)}x{round(dh * f)}" if f else "", r.get("detail", ""),
+                cells += [f"{round(dw * f)}x{round(dh * f)}" if f else "", r.get("detail", ""), r.get("noise", ""),
+                          ", ".join(picture_flags(r)),
                           f'![frame at {t // 60}:{t % 60:02d}]({snaps}/{r["snapshot"]} "frame at {t // 60}:{t % 60:02d}")'
                           if r.get("snapshot") else ""]
             cells += [r["duration_min"], round(r["size_mb"])]
@@ -483,6 +578,8 @@ def main():
     ap.add_argument("-j", "--jobs", type=int, default=min(16, (os.cpu_count() or 4) * 2), help="parallel ffprobe jobs")
     ap.add_argument("--cache", type=Path, default=DEFAULT_CACHE,
                     help="results cache shared by all libraries; unchanged files are skipped (default: %(default)s)")
+    ap.add_argument("--force", action="store_true",
+                    help="purge scanned videos' old cache entries and reanalyze, including already renamed files")
     ap.add_argument("--ext", help="comma-separated extensions to include (default: common video types)")
     ap.add_argument("--deep", action="store_true",
                     help="sample frames to measure effective resolution (finds blurry/upscaled files; slower)")
@@ -511,7 +608,10 @@ def main():
     files = list(scan(root, exts))
     print(f"Found {len(files)} video files under {root}", file=sys.stderr)
 
+    a.cache.parent.mkdir(parents=True, exist_ok=True)
     cache = load_cache(a.cache)
+    if a.force:
+        cache = purge_cache(a.cache, cache, files)
     rows, errors, todo = [], [], []
     for f in files:
         st = f.stat()
@@ -519,7 +619,8 @@ def main():
         cached = {k: v for k, v in cache[key].items() if k != "_key"} if key in cache else None
         if cached and "rotation" not in cached:  # from an older vqc version
             cached = None
-        if cached and (not a.deep or (cached.get("snapshot") == snap_name(key) and (snap_dir / snap_name(key)).is_file())):
+        if cached and (not a.deep or (cached.get("snapshot") == snap_name(key) and "noise" in cached
+                                      and (snap_dir / snap_name(key)).is_file())):
             rows.append(cached)
         else:
             todo.append((f, key, cached))
@@ -535,7 +636,6 @@ def main():
                 return r, f"deep: {e}"
         return r, None
 
-    a.cache.parent.mkdir(parents=True, exist_ok=True)
     bar = progress(len(files), "deep" if a.deep else "probe", initial=n_cached)
     bar.set_postfix_str(f"cached {n_cached}, errors 0")
     with bar, ThreadPoolExecutor(a.jobs) as pool, open(a.cache, "a") as cf:
@@ -559,13 +659,18 @@ def main():
     # Without --deep, ignore deep results that may be in the cache so the report matches the options.
     for r in rows:  # recompute so cached rows follow the current tier rules
         r["tier"] = tier_of(r["width"], r["height"])
+        if r.get("ssim_eff_height"):
+            r["eff_height"] = combine_height(r["ssim_eff_height"], r.get("resdet_height") or None)
         if r.get("eff_height"):
             r["eff_tier"] = tier_of(round(r["width"] * r["eff_height"] / r["height"]), r["eff_height"])
     tier = lambda r: (a.deep and r.get("eff_tier")) or r["tier"]
-    rows.sort(key=lambda r: (tier_rank[tier(r)], grade_rank[r["grade"]], -r["norm_bpp"]))
+    # Noise inflates the bitrate (so the bpp grade) without adding picture: heavy noise drops one grade.
+    noisy = lambda r: a.deep and isinstance(r.get("noise"), (int, float)) and r["noise"] >= NOISE_HEAVY
+    grade = lambda r: GRADES[min(grade_rank[r["grade"]] + 1, len(GRADES) - 1)][0] if noisy(r) else r["grade"]
+    rows.sort(key=lambda r: (tier_rank[tier(r)], grade_rank[grade(r)], -r["norm_bpp"]))
     groups = defaultdict(list)
     for r in rows:
-        r["group"] = f"{tier(r)}/{r['grade']}"
+        r["group"] = f"{tier(r)}/{grade(r)}"
         groups[r["group"]].append(r)
     rename_info = []
     if a.rename:
@@ -579,10 +684,12 @@ def main():
         ("command", f"`vqc {shlex.join(sys.argv[1:])}`"),
         ("mode", f"**deep**: {a.frames} frames per file, round-trip SSIM + "
                  + (f"resdet (`{a.resdet}`)" if a.resdet else "**no resdet** (SSIM only)")
+                 + f" + picture stats (noise >= {NOISE_HEAVY} drops one grade)"
                  if a.deep else "**metadata only** (no `--deep`: upscaled/blurry files are not detected)"),
         ("extensions", " ".join(sorted(exts)) if a.ext else f"default ({len(exts)} video types)"),
         ("files", f"{len(files)} found: {n_cached} from cache, {len(todo)} analyzed now, {len(errors)} with errors"),
         ("cache", f"`{a.cache}`"),
+        ("force", "yes (old entries purged; all scanned videos reanalyzed)" if a.force else "no"),
     ] + ([("snapshots", f"`{snap_dir}`")] if a.deep else []) + rename_info
     write_report(a.report, root, groups, errors, options, link_snapshots(a.report, snap_dir, rows) if a.deep else None)
 

@@ -72,11 +72,14 @@ The grade comes from `norm bpp`: bits per pixel (bitrate ÷ (width × height × 
 | fair | 0.04 – 0.08 | visible softness or artifacts in motion/dark scenes |
 | poor | < 0.04 | starved: blocking, smearing |
 
+With `--deep`, **heavy noise or grain lowers the grade one step** (measured noise ≥ 5, e.g. `excellent` → `good`). Noise makes the encoder spend many more bits, so a noisy file looks better by bitrate than it is. Light film grain doesn't count.
+
 ## Renaming rules
 
 | case | what happens |
 |---|---|
 | file already has a vqc prefix | the old prefix is replaced, never stacked; reruns only touch files whose quality changed |
+| recheck already-renamed files | use `--deep --force --rename` to purge their old cached scores, rerun picture checks and replace any outdated prefixes |
 | subtitles / sidecars with the same name (`Movie.srt`, `Movie.en.srt`, `Movie.nfo`) | renamed together with the video, so players still find them |
 | new name already taken | file skipped, listed under **Errors** in the report |
 | file can't be renamed (open in another program, name too long) | the video and its sidecars are left unchanged, listed under **Errors**; rerun `--rename` later |
