@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,119 @@ import vqc
 
 
 class DetectorTests(unittest.TestCase):
+    def test_flag_prefix_replacement_and_undo(self):
+        for initial in ("N_Movie.mp4", "10_1080p-good_N_Movie.mp4",
+                        "10_1080p-good_F-S_N_Movie.mp4"):
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                video = root / initial
+                video.write_bytes(b"video")
+                subtitle = video.with_suffix(".en.SRT")
+                subtitle.write_text("subtitle")
+                cache, undo = root / "cache.jsonl", root / "undo.sh"
+                for stats, deep, segment in (
+                    ({"noise": 3.5}, True, "F-N_"),
+                    ({"noise": 5}, True, "F-V_"),
+                    ({"noise": 5, "luma": 20, "crushed": 0.2,
+                      "clipped": 0.1, "saturation": 40}, True, "F-VDBHS_"),
+                    ({}, True, ""),
+                    ({"noise": 5, "luma": 20}, False, ""),
+                    ({"noise": 3.5, "crushed": 0.2}, True, "F-NB_"),
+                ):
+                    row = {"path": str(video), "group": "1080p/good", **stats}
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        done, same, errors = vqc.rename_files(
+                            [row], cache, root, undo, deep=deep
+                        )
+                        self.assertEqual(errors, [])
+                        self.assertEqual(done + same, 1)
+                        video = root / f"10_1080p-good_{segment}N_Movie.mp4"
+                        subtitle = root / f"10_1080p-good_{segment}N_Movie.en.SRT"
+                        self.assertEqual(row["path"], str(video))
+                        self.assertTrue(video.is_file())
+                        self.assertTrue(subtitle.is_file())
+                        self.assertEqual(vqc.PREFIX_RE.sub("", video.name, count=1), "N_Movie.mp4")
+                        self.assertEqual(vqc.rename_files([row], cache, root, undo, deep=deep),
+                                         (0, 1, []))
+                result = subprocess.run(["sh", str(undo)], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((root / "N_Movie.mp4").is_file())
+                self.assertTrue((root / "N_Movie.en.SRT").is_file())
+                self.assertEqual(len(list(root.glob("*.mp4"))), 1)
+
+    def test_flag_prefix_cache_purge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache.jsonl"
+            names = ("Movie.mp4", "10_1080p-good_Movie.mp4",
+                     "10_1080p-good_F-N_Movie.mp4", "10_1080p-good_F-VDBHS_Movie.mp4")
+            rows = [{"_key": f"{root / name}|1|1", "path": str(root / name)} for name in names]
+            unrelated = {"_key": f"{root / 'N_Movie.mp4'}|1|1", "path": str(root / "N_Movie.mp4")}
+            cache.write_text("".join(json.dumps(row) + "\n" for row in rows + [unrelated]))
+            retained = vqc.purge_cache(cache, vqc.load_cache(cache), [root / names[-1]])
+            self.assertEqual(retained, {unrelated["_key"]: unrelated})
+            self.assertEqual(vqc.load_cache(cache), retained)
+
+    def test_report_pagination(self):
+        for total, deep in ((0, True), (199, True), (200, True), (201, True),
+                            (400, True), (401, True), (401, False)):
+            with self.subTest(total=total, deep=deep), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                report = root / "quality report.md"
+                groups = {}
+                expected_files = []
+                for i in range(total):
+                    group = ("1080p/good", "720p/fair", "low/poor")[min(2, i * 3 // total)]
+                    filename = f"video{i:04d}.mp4"
+                    expected_files.append(filename)
+                    groups.setdefault(group, []).append({
+                        "path": str(root / filename), "width": 1920, "height": 1080,
+                        "codec": "h264", "video_kbps": 10000, "norm_bpp": 0.1,
+                        "size_mb": 1024, "duration_min": 1,
+                        "snapshot": f"{i}.jpg", "snapshot_t": 0,
+                    })
+                vqc.write_report(report, root, groups, [(root / "bad.mp4", "test error")],
+                                 [("mode", "deep" if deep else "metadata")],
+                                 "vqc_snapshots" if deep else None)
+                overview = report.read_text()
+                self.assertIn(f"· {total} files · {total:.1f} GB", overview)
+                self.assertIn("test error", overview)
+                for group, rows in groups.items():
+                    self.assertIn(f"| {group} | {len(rows)} | {len(rows):.1f} |", overview)
+                if total <= 200:
+                    pages = [report]
+                    self.assertNotIn("## File pages", overview)
+                    self.assertEqual(list(root.glob("*_part*.md")), [])
+                else:
+                    pages = sorted(root.glob("*_part*.md"))
+                    self.assertEqual(len(pages), (total + 199) // 200)
+                    self.assertEqual(overview.count("![frame"), 0)
+                    self.assertNotRegex(overview, r"(?m)^\| video\d")
+                    for i, page in enumerate(pages):
+                        self.assertIn(
+                            f"[Part {i + 1}]({vqc.urllib.parse.quote(page.name)})", overview
+                        )
+                found_files = []
+                for i, page in enumerate(pages):
+                    text = page.read_text()
+                    files = [line.split("|")[1].strip() for line in text.splitlines()
+                             if line.startswith("| video")]
+                    self.assertLessEqual(len(files), 200)
+                    self.assertEqual(text.count("![frame"), len(files) if deep else 0)
+                    found_files.extend(files)
+                    if total > 200:
+                        self.assertNotIn("test error", text)
+                        self.assertIn("[Overview](quality%20report.md)", text)
+                        if i:
+                            self.assertIn(
+                                f"[Previous]({vqc.urllib.parse.quote(pages[i - 1].name)})", text
+                            )
+                        if i + 1 < len(pages):
+                            self.assertIn(
+                                f"[Next]({vqc.urllib.parse.quote(pages[i + 1].name)})", text
+                            )
+                self.assertEqual(found_files, expected_files)
+
     def test_force_refresh(self):
         for mode, failure in ((False, None), (True, None), (False, "probe"),
                               (True, "probe"), (True, "deep")):
@@ -97,8 +211,8 @@ class DetectorTests(unittest.TestCase):
                         self.assertNotIn("eff_height", cached[key])
                         self.assertIn("forced deep failed", text)
                     elif mode:
-                        self.assertTrue((library / "22_low-good_Movie.mp4").is_file())
-                        self.assertTrue((library / "22_low-good_Movie.srt").is_file())
+                        self.assertTrue((library / "22_low-good_F-V_Movie.mp4").is_file())
+                        self.assertTrue((library / "22_low-good_F-V_Movie.srt").is_file())
                         self.assertIn("## low/good", text)
                     else:
                         self.assertTrue(video.is_file())
@@ -206,7 +320,7 @@ class DetectorTests(unittest.TestCase):
                     for _ in range(2):
                         with patch("sys.argv", args + ["--deep"]):
                             vqc.main()
-                        name = f"{vqc.quality_code('low', deep_grade)}_low-{deep_grade}_Movie"
+                        name = f"{vqc.quality_code('low', deep_grade)}_low-{deep_grade}_F-VDBHS_Movie"
                         self.assertTrue((root / f"{name}.mp4").is_file())
                         self.assertTrue((root / f"{name}.srt").is_file())
                         text = report.read_text()

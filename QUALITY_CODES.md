@@ -5,6 +5,9 @@
 ```
 RR_<tier>-<grade>_<original name>
 10_1080p-good_Movie.mkv
+
+RR_<tier>-<grade>_F-<letters>_<original name>  # deep mode, when flags are present
+22_low-good_F-VB_Movie.mkv
 ```
 
 | part | meaning |
@@ -12,9 +15,29 @@ RR_<tier>-<grade>_<original name>
 | `RR` | rank from `01` (best) to `24` (worst). A file explorer sorting A→Z lists the best videos first. |
 | `<tier>` | resolution class: how many pixels of real picture the video has |
 | `<grade>` | compression quality: how much data each pixel gets, adjusted for the codec |
+| `F-<letters>` | optional picture flags from `--deep`, explained below |
 | `<original name>` | unchanged |
 
 The rank is fixed: `10` always means 1080p/good, no matter what else is in your library. Resolution counts first and grade second, so any 1080p file ranks above any 720p file.
+
+## Picture-flag letters
+
+`--deep --rename` adds `F-` followed by the detected flag letters, always ordered **N/V, D, B, H, S**. With no flags, the entire `F-` segment is omitted.
+
+| Letter | Flag | Condition |
+|---|---|---|
+| `N` | noisy | Noise >= 3.5 and < 5 |
+| `V` | very noisy | Noise >= 5; replaces `N`, never both |
+| `D` | dark | Average luma < 32 |
+| `B` | crushed blacks | At least 15% of centre pixels have luma <= 18 |
+| `H` | clipped highlights | At least 5% of centre pixels have luma >= 233 |
+| `S` | saturated | Mean chroma magnitude >= 30 |
+
+For example, `22_low-good_F-VB_Movie.mp4` is very noisy with crushed blacks, while `10_1080p-good_F-DS_Movie.mp4` is dark and saturated. Letters label the existing measurements: they add no score penalty beyond the existing one-step heavy-noise adjustment.
+
+`F-` separates flags from titles such as `N_Movie.mp4`. A segment matching `F-<flag letters>_` immediately after the tier/grade is reserved for vqc. Legacy prefixes without flags remain supported.
+
+Reruns replace the whole prefix, including old flags. Metadata-only `--rename` removes flag letters rather than treating cached picture statistics as fresh measurements. Subtitles receive the same letters as their video, and undo removes the complete prefix.
 
 ## All codes
 
@@ -45,40 +68,17 @@ The rank is fixed: `10` always means 1080p/good, no matter what else is in your 
 | `23` | low | fair | `23_low-fair_Movie.mkv` |
 | `24` | low | poor | `24_low-poor_Movie.mkv` |
 
-## Tier: resolution
+## How the code is decided
 
-The tier is decided by pixel count, measured as a 16:9-equivalent height √(width × height × 9/16), so portrait phone videos, landscape videos and cinema crops are all judged fairly.
+The tier uses nominal resolution without `--deep`, and measured effective resolution with it. The grade uses codec-adjusted bitrate; heavy noise lowers it one step in deep mode. Neither label guarantees a particular visual appearance.
 
-| tier | equivalent height | typical sizes |
-|---|---|---|
-| 2160p | ≥ 1800 | 3840x2160, 2160x3840 (phone 4K) |
-| 1440p | ≥ 1300 | 2560x1440, 1440x3200 (QHD+ phone) |
-| 1080p | ≥ 860 | 1920x1080, 1080x1920, 1080x2400 (FHD+ phone), 1920x800 |
-| 720p | ≥ 580 | 1280x720, 720x1600 (HD+ phone) |
-| 480p | ≥ 400 | 854x480, 720x576, 540x960 |
-| low | < 400 | 640x360 and smaller |
-
-- **Without `--deep`**: the tier comes from the size stored in the file.
-- **With `--deep`**: the tier comes from the *effective* resolution measured from the picture itself. A 480p DVD rip upscaled to 1080p therefore gets a 480p code even though the file says 1080p. Use `--deep --rename` for the most honest codes.
-
-## Grade: compression
-
-The grade comes from `norm bpp`: bits per pixel (bitrate ÷ (width × height × fps)), multiplied by a codec factor (H.264 1.0, HEVC 1.6, AV1 2.0, Xvid 0.65, MPEG-2 0.5, …) and adjusted for resolution, so it means "H.264-equivalent bits per pixel at 1080p".
-
-| grade | norm bpp | what it looks like |
-|---|---|---|
-| excellent | ≥ 0.15 | transparent, no visible compression |
-| good | 0.08 – 0.15 | typical good streaming/encode quality |
-| fair | 0.04 – 0.08 | visible softness or artifacts in motion/dark scenes |
-| poor | < 0.04 | starved: blocking, smearing |
-
-With `--deep`, **heavy noise or grain lowers the grade one step** (measured noise ≥ 5, e.g. `excellent` → `good`). Noise makes the encoder spend many more bits, so a noisy file looks better by bitrate than it is. Light film grain doesn't count.
+The formulas, thresholds and limitations live in [SCORING_TESTS.md](SCORING_TESTS.md). Installation, forced refresh and report pages live in [README.md](README.md).
 
 ## Renaming rules
 
 | case | what happens |
 |---|---|
-| file already has a vqc prefix | the old prefix is replaced, never stacked; reruns only touch files whose quality changed |
+| file already has a vqc prefix | the old prefix and flags are replaced, never stacked; reruns only touch files whose quality or flags changed |
 | recheck already-renamed files | use `--deep --force --rename` to purge their old cached scores, rerun picture checks and replace any outdated prefixes |
 | subtitles / sidecars with the same name (`Movie.srt`, `Movie.en.srt`, `Movie.nfo`) | renamed together with the video, so players still find them |
 | new name already taken | file skipped, listed under **Errors** in the report |

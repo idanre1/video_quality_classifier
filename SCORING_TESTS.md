@@ -90,7 +90,7 @@ These checks are implemented locally with **NumPy**; ffmpeg decodes the sampled 
 - **Clipped highlights:** the fraction of Y/luma values at or above 233 measures how much of the centre crop is near white.
 - **Saturation:** the mean of `sqrt((U - 128)^2 + (V - 128)^2)` measures chroma strength relative to neutral colour.
 
-Values are combined using the median over sampled frames. Noise is estimated with the Immerkaer filter on 32-pixel blocks; the flattest 10% of eligible blocks reduce contamination by scene detail. Heavily clipped or too-small regions can leave noise unavailable.
+Values are combined using the median over sampled frames. Heavily clipped or too-small regions can leave noise unavailable.
 
 | Check | Condition | Scoring effect |
 |---|---|---|
@@ -103,19 +103,13 @@ Values are combined using the median over sampled frames. Noise is estimated wit
 
 Heavy-noise grades follow `excellent -> good -> fair -> poor`; a single run applies only one step, and repeated cached runs do not compound it.
 
+With `--deep --rename`, these same flags become an optional `F-` letter segment in filenames; the letters add no additional scoring adjustments. See [picture-flag letters](QUALITY_CODES.md#picture-flag-letters) for the convention.
+
 **Limitations:** intentional heavy film grain is penalised like unwanted noise. Night scenes may legitimately be dark. Vivid cartoons can trigger saturation flags. Colour manipulation cannot be established without a reference; a contrast/saturation boost may instead trigger crushed-black or clipping flags.
 
 There is no separate reliable banding, colour-fidelity, motion-artifact or artistic-quality score. ffmpeg `blockdetect` was investigated but is not part of scoring.
 
-## Running fresh checks on already-renamed files
-
-```bash
-uv run vqc /path/to/test/library --deep --force --rename
-```
-
-`--force` purges scanned videos' old cache entries before processing, including older size/mtime keys and names with previous vqc prefixes. Other videos' results stay cached. Fresh results are written back normally. `--rename` replaces an existing quality prefix instead of stacking another one; without it, names remain unchanged.
-
-`--force` alone reruns metadata checks only. Add `--deep` to rerun picture checks. It does not change thresholds or overwrite conflicting rename targets. Avoid running concurrent processes against the same cache while forcing a refresh.
+For commands, report pagination and forced refresh, see [README.md](README.md). For filename prefixes and undo, see [QUALITY_CODES.md](QUALITY_CODES.md).
 
 ## Validation tests, distinct from scoring checks
 
@@ -125,8 +119,59 @@ Run the automated regressions with:
 uv run python -m unittest -v test_vqc
 ```
 
-[test_vqc.py](test_vqc.py) covers SSIM/resdet combination boundaries, controlled noise measurement, YUV picture statistics, flag thresholds, cached reporting and repeated renaming. Workflow tests use temporary files and controlled detector results rather than real video decoding. Force-refresh tests cover cache purging, fresh processing and failure handling.
+[test_vqc.py](test_vqc.py) covers SSIM/resdet combination boundaries, controlled noise measurement, YUV picture statistics, flag thresholds, cached reporting and repeated renaming. Workflow tests use temporary files and controlled detector results rather than real video decoding. Force-refresh tests cover cache purging, fresh processing and failure handling. Report tests check page boundaries, a maximum of 200 pictures per file, complete row coverage and navigation.
 
 The separate real-video calibration challenge used two Xiph 1080p camera sequences, crowd_run and park_joy, with 15 variants each: originals, mild/strong blur, 540p and 720p upscales, grain, grain after upscaling, sharpening after blur, darkness, dark noise, contrast/saturation changes, colour casts, strong denoising, and blocky low-bitrate material re-encoded at high bitrate.
 
-The 30-video set was rerun with fresh ffmpeg/resdet analysis and its expected tiers, noise penalties and diagnostic flags checked. These measurements support the current thresholds on those scenes; they do not establish universal accuracy for an arbitrary library. The large calibration videos are not bundled with the repository. See [README.md](README.md#accuracy) for the measured outcomes.
+The 30-video set was rerun with fresh ffmpeg/resdet analysis and its expected tiers, noise penalties and diagnostic flags checked. These measurements support the current thresholds on those scenes; they do not establish universal accuracy for an arbitrary library. The large calibration videos are not bundled with the repository.
+
+### Measured outcomes
+
+An earlier set used four Xiph SVT 1080p sequences (crowd_run, park_joy, ducks_take_off, old_town_cross), encoded with x264 CRF 14:
+
+| Variant | Deep result |
+|---|---|
+| Original | 1080p, 4/4 |
+| 720p upscaled to 1080p | 720p, 4/4 |
+| 540p / 360p upscaled to 1080p | 480p, 8/8 |
+| Gaussian blur sigma = 1 | 720p, 3/4; 480p, 1/4 |
+| Light denoising with hqdn3d | 1080p, 4/4; not flagged |
+
+resdet found all 12 conventional upscales at the exact source height, with no false positives on those originals.
+
+The 30-video challenge used x264 CRF 16; all variants were excellent by bitrate alone:
+
+| Variant | Deep result |
+|---|---|
+| Original | 1080p/excellent, no flags |
+| Blur sigma = 1 / sigma = 2 | 720p / low |
+| Strong blur then sharpening | 720p |
+| Strong denoising | 720p |
+| 720p bicubic/Lanczos / 540p upscales | 720p / 480p |
+| 540p upscale then grain | 480p, grade reduced, very noisy |
+| Heavy grain on a sharp original | 1080p, grade reduced, very noisy |
+| Underexposure / underexposure plus noise | Dark and crushed blacks; added heavy noise also reduces the grade |
+| Contrast/saturation boost and colour cast | 1080p; saturation and/or black/highlight flags, depending on the scene |
+| CRF 44 blocky encode re-encoded at high bitrate | low; bitrate grade remains excellent |
+
+The colour-boosted park_joy clip triggered dark/crushed-black flags, not saturation: this illustrates why these flags are diagnostics rather than proof of manipulation.
+
+### Other methods investigated
+
+| Method | Why it was not used |
+|---|---|
+| ffmpeg blurdetect | Tracked scene content more than blur |
+| ffmpeg blockdetect | Weak separation; a colour-cast clip scored higher than real blocking |
+| DOVER | Rated 720p upscales above originals in four tested scenes |
+| pyiqa TOPIQ / MUSIQ | Scores overlapped across scenes and favoured denoised copies |
+| pyiqa Q-Align | Resized to 448 pixels, obscuring resolution loss; about 100 seconds per crop on CPU |
+
+The tested PyTorch models also require substantial compute and have non-commercial licensing restrictions.
+
+### Sources
+
+- [Streaming Learning Center: Power of .75 rule](https://streaminglearningcenter.com/blogs/five-checks-for-your-encoding-ladder.html): resolution normalisation and typical H.264 bpp.
+- Wikipedia codec articles: [HEVC](https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding), [AV1](https://en.wikipedia.org/wiki/AV1), [AVC](https://en.wikipedia.org/wiki/Advanced_Video_Coding).
+- [resdet](https://github.com/0x09/resdet): resizing-trace detection.
+- [Video quality tools overview](https://www.forasoft.com/learn/video-quality/articles-vqm/open-source-no-reference-tools).
+- [video-quality-scanner](https://github.com/sisyphosloughs/video-quality-scanner): a related resolution-based library tool.

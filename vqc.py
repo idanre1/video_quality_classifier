@@ -30,6 +30,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -284,6 +285,12 @@ def combine_height(ssim_h, rd_h):
     return rd_h or ssim_h
 
 
+FLAG_LETTERS = {
+    "noisy": "N", "very noisy": "V", "dark": "D", "crushed blacks": "B",
+    "clipped highlights": "H", "saturated": "S",
+}
+
+
 def picture_flags(r):
     n = r.get("noise")
     flags = [("very noisy" if n >= NOISE_HEAVY else "noisy")] if n != "" and n is not None and n >= NOISE_NOISY else []
@@ -369,21 +376,46 @@ def _md(text):
     return re.sub(r"([\\`*_\[\]<>|#])", r"\\\1", str(text))
 
 
+REPORT_PAGE_SIZE = 200
+
+
 def write_report(path, root, groups, errors, options, snaps):
     """Markdown report: options, summary per group, then one table per group (best norm_bpp first).
     snaps: folder (relative to the report) holding --deep snapshots, or None."""
     total = sum(len(rs) for rs in groups.values())
     gb = sum(r["size_mb"] for rs in groups.values() for r in rs) / 1024
+    path = Path(path)
+    parts = []
+    if total > REPORT_PAGE_SIZE:
+        rows = [(g, r) for g, rs in groups.items() for r in rs]
+        parts = [path.with_name(f"{path.stem}_part{i + 1:03d}{path.suffix}")
+                 for i in range((total + REPORT_PAGE_SIZE - 1) // REPORT_PAGE_SIZE)]
+        for i, part in enumerate(parts):
+            page_groups = defaultdict(list)
+            for g, r in rows[i * REPORT_PAGE_SIZE:(i + 1) * REPORT_PAGE_SIZE]:
+                page_groups[g].append(r)
+            navigation = [f"[Overview]({urllib.parse.quote(path.name)})"]
+            if i:
+                navigation.append(f"[Previous]({urllib.parse.quote(parts[i - 1].name)})")
+            if i + 1 < len(parts):
+                navigation.append(f"[Next]({urllib.parse.quote(parts[i + 1].name)})")
+            write_report(part, root, page_groups, [], options + [("navigation", " · ".join(navigation))], snaps)
     out = ["# Video quality report", "", f"`{root}` · {total} files · {gb:.1f} GB · {time.strftime('%Y-%m-%d %H:%M')}",
            "", "## Options", "", "| option | value |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in options]
     out += ["", "## Summary", "", "| group | files | size GB |", "|---|--:|--:|"]
     for g, rs in groups.items():
         out.append(f"| {g} | {len(rs)} | {sum(r['size_mb'] for r in rs) / 1024:.1f} |")
+    if parts:
+        out += ["", "## File pages", "", "Each page contains at most 200 videos and pictures.", "",
+                "| page | videos |", "|---|--:|"]
+        out += [f"| [Part {i + 1}]({urllib.parse.quote(part.name)}) | "
+                f"{min(REPORT_PAGE_SIZE, total - i * REPORT_PAGE_SIZE)} |"
+                for i, part in enumerate(parts)]
     deep = snaps is not None
     head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] \
         + (["effective", "detail", "noise", "flags", "snapshot"] if deep else []) + ["min", "MB"]
-    for g, rs in groups.items():
+    for g, rs in (groups.items() if not parts else []):
         out += ["", f"## {g}", "", "| " + " | ".join(head) + " |",
                 "|---|---|---|--:|--:|" + ("--:|--:|--:|---|---|" if deep else "") + "--:|--:|"]
         for r in rs:
@@ -415,7 +447,8 @@ def quality_code(tier, grade):
     return f"{t * len(GRADES) + g + 1:02d}"
 
 
-PREFIX_RE = re.compile(r"^\d{2}_(%s)-(%s)_" % ("|".join(n for n, _ in RES_TIERS), "|".join(n for n, _ in GRADES)))
+PREFIX_RE = re.compile(r"^\d{2}_(%s)-(%s)_(?:F-[NVDBHS]+_)?"
+                       % ("|".join(n for n, _ in RES_TIERS), "|".join(n for n, _ in GRADES)))
 
 
 def progress(total, desc, initial=0):
@@ -424,8 +457,8 @@ def progress(total, desc, initial=0):
                                            "[{elapsed}<{remaining}, {rate_fmt}{postfix}]")
 
 
-def rename_files(rows, cache_path, snap_dir, undo_path):
-    """Prefix each video (and same-stem sidecars such as .srt/.nfo) with RR_<tier>-<grade>_.
+def rename_files(rows, cache_path, snap_dir, undo_path, deep=False):
+    """Prefix each video and same-stem sidecars with RR_<tier>-<grade>_ and optional F-<flags>_.
     Existing vqc prefixes are replaced, never stacked. Cache rows and snapshots follow the new names so
     nothing is re-analyzed. undo_path gets a script that strips the prefix from every file again.
     A file that cannot be renamed (e.g. open in a player on a Windows share) is rolled back and reported."""
@@ -439,6 +472,9 @@ def rename_files(rows, cache_path, snap_dir, undo_path):
                                     refresh=False)
                 tier, grade = r["group"].split("/")
                 pre = f"{quality_code(tier, grade)}_{tier}-{grade}_"
+                letters = "".join(FLAG_LETTERS[flag] for flag in picture_flags(r)) if deep else ""
+                if letters:
+                    pre += f"F-{letters}_"
                 new = p.with_name(pre + PREFIX_RE.sub("", p.name, count=1))
                 if p.parent not in listings:  # list each folder once: listings are slow on network drives
                     listings[p.parent] = list(p.parent.iterdir())
@@ -675,7 +711,7 @@ def main():
     rename_info = []
     if a.rename:
         undo = a.report.resolve().parent / "vqc_undo_rename.sh"
-        done, same, rn_err = rename_files(rows, a.cache, snap_dir, undo)
+        done, same, rn_err = rename_files(rows, a.cache, snap_dir, undo, deep=a.deep)
         errors += rn_err
         rename_info = [("rename", f"{done} renamed, {same} already named, {len(rn_err)} skipped; "
                                   f"undo: `{undo}`")]
