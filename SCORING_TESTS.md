@@ -96,7 +96,7 @@ These checks are implemented locally with **NumPy**; ffmpeg decodes the sampled 
 
 Values are combined using the median over sampled frames. Heavily clipped or too-small regions can leave noise unavailable.
 
-In the existing scoring path, the noise filter excludes luma values <= 1 and >= 254; it does not adapt that eligibility mask to a limited-range black floor near 16. Its noise is measured only on Y, and quiet-block selection can hide other regions. The separate opt-in temporal diagnostic below does not replace this estimator or its penalty. Calibrated noise severity and affected-duration estimates are not implemented.
+In the existing spatial scoring path, the noise filter excludes luma values <= 1 and >= 254; it does not adapt that eligibility mask to a limited-range black floor near 16. Its noise is measured only on Y, and quiet-block selection can hide other regions. Temporal checks below now run automatically with `--deep` and supplement this estimator. Universally calibrated noise severity and affected-duration estimates are not implemented.
 
 | Check | Condition | Scoring effect |
 |---|---|---|
@@ -107,7 +107,7 @@ In the existing scoring path, the noise filter excludes luma values <= 1 and >= 
 | clipped highlights | at least 5% of centre-crop luma values >= 233 | flag only |
 | saturated | mean chroma magnitude relative to neutral U/V = 128 is >= 30 | flag only |
 
-Heavy-noise grades follow `excellent -> good -> fair -> poor`; a single run applies only one step, and repeated cached runs do not compound it.
+Grades follow `excellent -> good -> fair -> poor`. Spatial-heavy noise alone applies one step; temporal noise can apply one or two steps as below. Use the maximum penalty, not their sum, clamped at `poor`. Each run starts from the raw metadata grade, so cached/forced reruns do not compound penalties. `V` wins over `N` when combining flags.
 
 With `--deep --rename`, these same flags become an optional `F-` letter segment in filenames; the letters add no additional scoring adjustments. See [picture-flag letters](QUALITY_CODES.md#picture-flag-letters) for the convention.
 
@@ -117,9 +117,23 @@ There is no separate banding, blocking, ringing, freeze, cadence, flicker, ghost
 
 For commands, report pagination and forced refresh, see [README.md](README.md). For filename prefixes and undo, see [QUALITY_CODES.md](QUALITY_CODES.md).
 
-## 6. Experimental temporal diagnostics: opt-in, not scoring
+## 6. Temporal noise: automatic deep scoring and optional diagnostic review
 
-`--noise-diagnostics` runs a separate local NumPy/ffmpeg path. It does not change the old deep sampler, noise estimate, grades, groups or filename flags, and does not apply a denoising filter to files. The former experimental spatial detector was removed: private evaluation found clean fine-detail false positives at high eligibility. Algorithm version 2 automatically replaces version-1 diagnostic cache entries.
+`--deep` now includes the local NumPy/ffmpeg temporal path automatically and uses its flags/penalties. `--noise-diagnostics` alone runs the same measurement for review, leaving metadata grades unchanged and adding no filename flags; explicit `--rename` still applies normal metadata prefixes. Neither applies a denoising filter to files. The old deep sampler/spatial estimate remains in place. The former experimental spatial detector was removed: private evaluation found clean fine-detail false positives at high eligibility. Algorithm version 2 automatically replaces version-1 diagnostic cache entries.
+
+### User-approved noise decisions
+
+Only current-version `aligned-temporal` results with status `ok`, finite residual and **coverage >0.20** qualify:
+
+| Residual | Temporal flag | Penalty with `--deep` |
+|---|---|---|
+| <1.726 | none | none |
+| >=1.726 and <=3 | `N` noisy | One grade |
+| >3 | `V` very noisy | Two grades |
+
+Exactly 20% coverage is excluded; exactly 1.726 qualifies; exactly 3 still receives one grade. Unsupported, insufficient, failed and obsolete results add no temporal flag/penalty; the existing spatial checks still operate. No double penalty: apply `max(spatial penalty, temporal penalty)`. Resolution tiers do not change because of this rule.
+
+These are library-specific thresholds approved after private playback review (including useful 20-40% coverage). Four permission-cleared local video fixtures separated low-light examples (1.726 at 20.1-21.7% coverage) from the two stabilization controls (0 at 64.5-71.2%). Both controls appeared equivalent to the user; no stabilization-quality claim follows. Media and all derived files live under Git-ignored `fixtures/` and are not licensed for repository distribution.
 
 | Step | Implemented behaviour |
 |---|---|
@@ -144,11 +158,11 @@ The source precision is not reduced to 8 bits, but analysis uses 4:2:0 chroma. T
 
 Flat black/white regions, repeats or too few matched frames do not establish cleanliness: fewer than two measured pairs in every burst yields **insufficient evidence**, with no review score. Other statuses are **ok**, **unsupported** and **error**. Reliable coverage counts accepted luma tiles over attempted pairs/scales, including rejected/repeated pairs in the denominator; it is not confidence or affected-video duration. Chroma eligibility can be lower and is recorded separately in the cache.
 
-The separate `_noise.md` report has at most 200 videos per page. Metadata/deep caches are preserved on diagnostic upgrades; incompatible or failed diagnostic entries are not reused as successful results.
+Both deep and diagnostic-only commands write a separate `_noise.md` report with at most 200 videos per page and informational temporal flags. Main deep reports include temporal residual/coverage and the requested noise grade drop (actual grade stops at `poor`). Valid temporal/deep caches are preserved on upgrades; old deep caches gain temporal measurements without repeating valid picture checks, while threshold-only changes reuse valid measurements and recompute decisions. Incompatible or failed temporal entries are not reused as successful results.
 
 Stable detail should cancel, but independent motion, interpolation, compression and intentional grain can still produce residuals. Severe/coarse noise can fail motion-reliability gates, and temporally persistent/frozen noise can have low residuals. Exact decoded repeats are counted, but there is no general freeze or periodic-refresh detector. This is experimental evidence for playback review, not proof of noise, cleanliness, sensor sigma or overall quality.
 
-Diagnostics introduce no dependency or model download. Source probing and decoding are restricted to local file/pipe protocols in this mode, including existing deep sampling when combined with diagnostics. When combined with `--deep`, only an installed/explicit resdet is used. Original files stay unchanged unless the user separately requests normal `--rename`.
+Temporal checks introduce no dependency or model download and use local file/pipe protocols. Explicit `--noise-diagnostics` also restricts source probing and existing deep sampling, and skips automatic resdet setup; plain `--deep` retains its existing resdet setup. Original files stay unchanged unless the user separately requests normal `--rename`.
 
 ## Validation tests, distinct from scoring checks
 
@@ -159,6 +173,8 @@ uv run python -m unittest -v test_vqc test_noise_diagnostics
 ```
 
 [test_vqc.py](test_vqc.py) covers SSIM/resdet combination boundaries, controlled noise measurement, YUV picture statistics, flag thresholds, cached reporting and repeated renaming. Workflow tests use temporary files and controlled detector results rather than real video decoding. Force-refresh tests cover cache purging, fresh processing and failure handling. Report tests check page boundaries, a maximum of 200 pictures per file, complete row coverage and navigation.
+
+Temporal scoring regressions check strict coverage >20%, inclusive residual >=1.726, strict severe residual >3, finite valid current-version evidence, maximum-not-sum penalties, the `poor` floor, and all starting grades. Workflow tests upgrade old deep caches, reuse valid measurements, repeat cached/forced video-and-subtitle renames without stacking prefixes or penalties, and restore metadata-only grades/flag-free names without using cached temporal penalties.
 
 [test_noise_diagnostics.py](test_noise_diagnostics.py) checks stable fine detail, integer translation, subpixel/local-motion rejection, independent luma/chroma noise and correlated disturbance, smooth gradients, black-floor rejection, repeats/refresh and bad timing, and unsupported sources. Actual 4K arrays verify that fine-detail translation cancels and half-pixel motion remains rejected at every scale. Encoded detailed clean/moving controls must stay below 2 residual levels while injected luma/chroma noise exceeds 4 and more than twice the clean controls; these are fixture acceptance checks, not real-library thresholds. Real 8/10-bit full/limited-range fixtures are checked against independently computed quantized temporal residuals (within 0.05 levels) and decoded normalized pixels. Integration tests cover consecutive PTS/non-keyframes, source offsets, short clips, local protocols/decoder threads, default-score preservation, version-1 cache migration, upgrades/failures and pagination. These tests do not establish real-phone accuracy.
 

@@ -76,6 +76,8 @@ Check the exact software and model-weight licences before any future dependency 
 | Prototype selection, 2026-11-01 | Opt-in spatial diagnostics separate from scoring; temporal and ranking work remain conditional |
 | Private evaluation, 2026-11-02 | Clean high-resolution detail ranked highly with >70% spatial eligibility; spatial selection was insufficiently specific |
 | Replacement approved, 2026-11-02 | Remove experimental spatial ranking; try aligned consecutive-frame diagnostics while preserving older deep-scoring noise logic and all filename/scoring behaviour |
+| Private temporal evaluation, 2026-11-02 | User reported highest residuals matched largest noise and 20-40% coverage was useful; four local permission-cleared examples supported low-light/control separation, without establishing universal thresholds |
+| Deep scoring approved, 2026-11-02 | Temporal checks included in every deep run; coverage >20%, residual >=1.726 / >3 for one/two-grade penalties and N/V flags; maximum with old penalty, never stacked |
 
 The independent review identified keyframe-biased sampling, black-floor selection, coarse chroma noise, motion-localized disturbance, periodic refresh, viewing scale, coverage, cache compatibility, privacy and runtime as concerns.
 

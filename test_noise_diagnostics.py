@@ -296,12 +296,13 @@ class NoiseDiagnosticTests(unittest.TestCase):
                 with patch("sys.argv", args), patch.object(vqc, "ensure_resdet", return_value=None):
                     vqc.main()
                 baseline = next(iter(vqc.load_cache(cache).values()))
+                self.assertEqual(baseline["_noise_diag"]["status"], "ok")
                 with patch("sys.argv", args + ["--noise-diagnostics"]), \
                         patch.object(vqc, "ensure_resdet", side_effect=AssertionError("download")), \
                         patch.object(vqc, "deep_analyze", side_effect=AssertionError("repeat deep")):
                     vqc.main()
                 updated = next(iter(vqc.load_cache(cache).values()))
-                self.assertEqual({k: v for k, v in updated.items() if k != "_noise_diag"}, baseline)
+                self.assertEqual(updated, baseline)
                 self.assertEqual(updated["_noise_diag"]["status"], "ok")
 
     def test_source_offset_and_short_black_clip(self):

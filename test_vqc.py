@@ -188,6 +188,10 @@ class DetectorTests(unittest.TestCase):
                         patch.object(vqc, "ensure_resdet", return_value=None), \
                         patch.object(vqc, "analyze", side_effect=probe) as analyze, \
                         patch.object(vqc, "deep_analyze", side_effect=deep_result) as deep, \
+                        patch.object(vqc, "ffprobe", return_value={}), \
+                        patch.object(vqc.noise_diagnostics, "analyze_noise", return_value={
+                            "signature": vqc.noise_diagnostics.cache_signature(8),
+                            "status": "unsupported", "reason": "test unsupported source"}), \
                         contextlib.redirect_stdout(io.StringIO()), \
                         contextlib.redirect_stderr(io.StringIO()):
                     vqc.main()
@@ -255,6 +259,90 @@ class DetectorTests(unittest.TestCase):
         self.assertIsNone(vqc._noise_sigma(np.zeros_like(clean)))
         self.assertIsNone(vqc._noise_sigma(clean[:16, :16]))
 
+    def test_temporal_noise_thresholds_and_nonstacking(self):
+        def row(score, coverage=0.3, status="ok", noise=0, version=None):
+            return {"noise": noise, "_noise_diag": {
+                "status": status, "method": "aligned-temporal",
+                "signature": {"version": vqc.noise_diagnostics.VERSION if version is None else version},
+                "review_score": score, "coverage": coverage}}
+
+        for score, coverage, level in (
+                (1.725, 0.4, 0), (1.726, 0.2, 0), (1.726, 0.2001, 1),
+                (3, 0.4, 1), (3.001, 0.4, 2), (9, 0.1999, 0),
+                (9, 1, 2), (9, 1.01, 0), (None, 0.3, 0),
+                (float("nan"), 0.3, 0), (float("inf"), 0.3, 0)):
+            with self.subTest(score=score, coverage=coverage):
+                r = row(score, coverage)
+                self.assertEqual(vqc.temporal_noise_level(r), level)
+                self.assertEqual(vqc.noise_penalty(r), level)
+                self.assertEqual(vqc.picture_flags(r), {0: [], 1: ["noisy"], 2: ["very noisy"]}[level])
+        for status in ("unsupported", "error", "insufficient evidence"):
+            self.assertEqual(vqc.noise_penalty(row(9, status=status)), 0)
+        self.assertEqual(vqc.noise_penalty(row(9, version=1)), 0)
+        self.assertEqual(vqc.noise_penalty(row(2, noise=9)), 1)
+        self.assertEqual(vqc.noise_penalty(row(4, noise=9)), 2)
+        self.assertEqual(vqc.picture_flags(row(2, noise=9)), ["very noisy"])
+
+    def test_temporal_deep_upgrade_rename_force_and_metadata(self):
+        for raw_grade in ("excellent", "good", "fair", "poor"):
+            for score, drop, letter in ((1.726, 1, "N"), (3.001, 2, "V")):
+                with self.subTest(grade=raw_grade, score=score), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    video = root / "Movie.mp4"
+                    video.write_bytes(b"fixture")
+                    video.with_suffix(".srt").write_text("subtitle")
+                    cache, report = root / "cache.jsonl", root / "report.md"
+                    snap_dir = root / "snapshots"
+                    snap_dir.mkdir()
+                    st = video.stat()
+                    key = f"{video}|{st.st_size}|{int(st.st_mtime)}"
+                    snap = vqc.snap_name(key)
+                    (snap_dir / snap).write_bytes(b"snapshot")
+                    raw = {"path": str(video), "tier": "1080p", "grade": raw_grade,
+                           "group": f"1080p/{raw_grade}", "width": 1920, "height": 1080,
+                           "rotation": 0, "norm_bpp": 0.2, "codec": "h264", "video_kbps": 10000,
+                           "duration_min": 1, "size_mb": 10}
+                    cache.write_text(json.dumps({**raw, "_key": key, "noise": 0, "snapshot": snap}) + "\n")
+                    diag = {"signature": vqc.noise_diagnostics.cache_signature(8),
+                            "method": "aligned-temporal", "status": "ok",
+                            "review_score": score, "coverage": 0.3}
+                    grades = [name for name, _ in vqc.GRADES]
+                    expected = grades[min(grades.index(raw_grade) + drop, len(grades) - 1)]
+                    base_args = ["vqc", str(root), "--cache", str(cache), "-o", str(report), "--rename"]
+
+                    def probe(path):
+                        return {**raw, "path": str(path)}
+
+                    def deep_result(row, frames, resdet, snapshot):
+                        snapshot.write_bytes(b"snapshot")
+                        return {"noise": 0, "snapshot": snapshot.name}
+
+                    with patch.object(vqc, "in_uv_venv", return_value=True), \
+                            patch.object(vqc, "ensure_resdet", return_value=None), \
+                            patch.object(vqc, "ffprobe", return_value={}), \
+                            patch.object(vqc, "analyze", side_effect=probe), \
+                            patch.object(vqc, "deep_analyze", side_effect=deep_result) as deep, \
+                            patch.object(vqc.noise_diagnostics, "analyze_noise", return_value=diag) as temporal, \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        for extra in (["--deep"], ["--deep"], ["--deep", "--force"]):
+                            with patch("sys.argv", base_args + extra):
+                                vqc.main()
+                            name = f"{vqc.quality_code('1080p', expected)}_1080p-{expected}_F-{letter}_Movie"
+                            self.assertTrue((root / f"{name}.mp4").is_file())
+                            self.assertTrue((root / f"{name}.srt").is_file())
+                            self.assertEqual(len(list(root.glob("*.mp4"))), 1)
+                            self.assertIn(f"## 1080p/{expected}", report.read_text())
+                            self.assertIn(f"| {letter} |", (root / "report_noise.md").read_text())
+                        self.assertEqual(deep.call_count, 1)  # Only force repeats an already valid deep analysis.
+                        self.assertEqual(temporal.call_count, 2)
+                        with patch("sys.argv", base_args):
+                            vqc.main()
+                        name = f"{vqc.quality_code('1080p', raw_grade)}_1080p-{raw_grade}_Movie"
+                        self.assertTrue((root / f"{name}.mp4").is_file())
+                        self.assertTrue((root / f"{name}.srt").is_file())
+                        self.assertNotIn("Local temporal review", report.read_text())
+
     def test_picture_stats_and_flags(self):
         y = np.full((512, 512), 16, dtype=np.uint8)
         u = np.full((256, 256), 168, dtype=np.uint8)
@@ -315,6 +403,10 @@ class DetectorTests(unittest.TestCase):
                         patch.object(vqc, "ensure_resdet", return_value=None), \
                         patch.object(vqc, "analyze", return_value=row) as probe, \
                         patch.object(vqc, "deep_analyze", side_effect=deep_result) as deep, \
+                        patch.object(vqc, "ffprobe", return_value={}), \
+                        patch.object(vqc.noise_diagnostics, "analyze_noise", return_value={
+                            "signature": vqc.noise_diagnostics.cache_signature(8),
+                            "status": "unsupported", "reason": "test unsupported source"}), \
                         contextlib.redirect_stdout(io.StringIO()), \
                         contextlib.redirect_stderr(io.StringIO()):
                     for _ in range(2):
@@ -326,7 +418,8 @@ class DetectorTests(unittest.TestCase):
                         text = report.read_text()
                         self.assertIn(f"## low/{deep_grade}", text)
                         self.assertIn("very noisy, dark, crushed blacks, clipped highlights, saturated", text)
-                        self.assertIn("| effective | detail | noise | flags | snapshot |", text)
+                        self.assertIn("| effective | detail | noise | temporal residual | temporal coverage | "
+                                      "noise grade drop | flags | snapshot |", text)
                         self.assertIn("640x360", text)
                     self.assertEqual(probe.call_count, 1)
                     self.assertEqual(deep.call_count, 1)

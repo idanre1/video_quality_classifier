@@ -1,6 +1,6 @@
 # Noise-diagnostic implementation plan and progress
 
-**Approved scope:** replace the failed experimental spatial detector with temporal diagnostics. Keep the older `--deep` noise estimate, `N/V` flags and grade penalty unchanged. No new score/group/filename adjustments.
+**Approved scope:** temporal checks now run automatically with every `--deep` command. With coverage >20%, residual >=1.726 adds `N` and one grade penalty; residual >3 adds `V` and two grades. Keep the older spatial estimate and use the larger spatial/temporal penalty, never their sum. Diagnostic-only commands retain metadata grades.
 
 Research and selection history live in [research.md](research.md). Current measurements and rejection rules live in [SCORING_TESTS.md](SCORING_TESTS.md). Usage is in [README.md](README.md).
 
@@ -15,9 +15,9 @@ Research and selection history live in [research.md](research.md). Current measu
 
 Private evaluation found clean high-resolution fine detail near the top of the spatial-variation report despite >70% eligibility. Synthetic noise sensitivity did not establish sufficient specificity against detail.
 
-The spatial residual estimator and its review score have been removed from the experimental path. Existing deep-scoring noise logic is deliberately unaffected, per the user's explicit scope choice.
+The spatial residual estimator and its review score have been removed from the experimental path. The older deep-scoring spatial estimator remains as supplementary evidence.
 
-## Phase 2: temporal diagnostic, implemented for another private trial
+## Phase 2: temporal diagnostic, privately evaluated
 
 - Up to `--frames` four-frame consecutive bursts, with distinct PTS/frame-pair accounting.
 - Global integer translation from phase correlation and pyramid refinement, with a native-patch retry when coarse averaging hides fine detail; no interpolated luma.
@@ -29,7 +29,16 @@ The spatial residual estimator and its review score have been removed from the e
 - Version-1 spatial cache entries automatically upgrade to version 2 without discarding valid metadata/deep results.
 - At most two workers, one four-frame local temporary decode file per worker, 30-second decode timeout and 120-second diagnostic per-file budget.
 
-**Remaining gate:** useful discrimination on private recordings at acceptable false-positive, abstention and runtime rates. This is not approval for scoring penalties or a claim that temporal evidence proves noise.
+Private playback review reported that higher temporal residuals matched larger noise, including at 20-40% coverage. Four permission-cleared public samples were evaluated locally; all media/cache/reports are excluded from Git. The user subsequently approved deep-scoring integration under the rules above. This does not establish universal thresholds or prove that every temporal fluctuation is unwanted noise.
+
+## Phase 3: approved deep-scoring integration
+
+- Every deep run obtains/reuses temporal results; legacy deep caches upgrade without repeating valid picture checks.
+- Single `N`/`V` flag chosen from the strongest spatial/temporal flag; unchanged D/B/H/S rules and prefix replacement.
+- One/two-step temporal penalty combined by maximum with the old spatial one-step penalty, clamped at poor.
+- Raw metadata grade retained in cache; forced/cached/rename reruns cannot accumulate penalties.
+- Diagnostic-only and metadata-only grades remain unchanged, even if a cached temporal result exists.
+- Failures/unsupported/insufficient evidence remain explicit and introduce no temporal penalty.
 
 ### Known boundaries
 
@@ -39,7 +48,7 @@ CAMBI, ghosting, broad perceptual models and ranking changes remain outside this
 
 ## Privacy and compatibility contract
 
-- Default commands and existing deep scores/flags behave as before.
+- Metadata-only commands behave as before; deep mode intentionally includes temporal scoring and may change grades, ordering and filename flags when renaming is requested.
 - No private file/frame/path/metadata uploads or model downloads.
 - Source probing/decoding in diagnostic mode allows only local file/pipe protocols.
 - No new dependency; temporary decoded data is local and automatically closed/deleted, including failures.
@@ -56,7 +65,7 @@ Start with a small mixed subset, especially the previous clean-detail false posi
 uv run vqc /path/to/subset --noise-diagnostics --frames 3 -j 1 -o temporal_trial.md
 ```
 
-Default broader sampling is eight burst positions. Add `--deep` only if you also want the existing scoring checks/snapshots. `--force` is not needed for the spatial-to-temporal cache upgrade.
+Default broader sampling is eight burst positions. Use `uv run vqc /path/to/library --deep -j 4` for deep scoring including temporal checks. Add `--rename` only when ready to update names. `--force` is not needed for temporal cache/scoring upgrades. Explicit `--noise-diagnostics` remains useful for review-only runs.
 
 Open `temporal_trial_noise.md` and compare against playback:
 
@@ -75,9 +84,11 @@ Do not compare the old spatial number with the new temporal number: they measure
 - [x] Real 8/10-bit full/limited-range residuals checked against quantization-aware expected values and normalized pixels.
 - [x] Real consecutive timestamps/non-keyframes, source offsets and short-clip abstention.
 - [x] Existing scoring/rename regressions, cache migration/errors and report pagination.
-- [x] All 21 regression tests pass; package, Pylance diagnostics, CLI help and documentation links checked.
+- [x] All 23 regression tests pass, including temporal scoring boundaries, nonstacking penalties and cached/forced rename workflows; Pylance diagnostics and documentation links checked.
 - [x] Final synthetic high-resolution resource measurement after all rejection gates.
 - [ ] Private usefulness, false positives, abstention and target-machine total memory/runtime.
+
+Private temporal ordering and the proposed thresholds have been approved; wider false-positive/missed-case coverage remains unvalidated. The four ignored local fixtures were rechecked with deep scoring: both low-light inputs receive temporal `N` / one step, while both stabilization controls receive no noise penalty. No fixture videos were renamed.
 
 Measurements on generated clips do not certify another codec, recording style or machine. FFmpeg child memory must be included when checking the user's total resource budget.
 

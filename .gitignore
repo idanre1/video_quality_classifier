@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local evaluation media and derived outputs; not approved for redistribution.
+/fixtures/

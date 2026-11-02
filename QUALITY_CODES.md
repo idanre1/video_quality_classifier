@@ -14,7 +14,7 @@ RR_<tier>-<grade>_F-<letters>_<original name>  # deep mode, when flags are prese
 |---|---|
 | `RR` | rank from `01` (best) to `24` (worst). A file explorer sorting A→Z lists the best videos first. |
 | `<tier>` | resolution class: how many pixels of real picture the video has |
-| `<grade>` | compression quality: how much data each pixel gets, adjusted for the codec |
+| `<grade>` | codec-adjusted compression grade, with noise penalties in deep mode |
 | `F-<letters>` | optional picture flags from `--deep`, explained below |
 | `<original name>` | unchanged |
 
@@ -26,14 +26,14 @@ The rank is fixed: `10` always means 1080p/good, no matter what else is in your 
 
 | Letter | Flag | Condition |
 |---|---|---|
-| `N` | noisy | Noise >= 3.5 and < 5 |
-| `V` | very noisy | Noise >= 5; replaces `N`, never both |
+| `N` | noisy | Spatial sigma >=3.5 and <5, or temporal coverage >20% and residual >=1.726 and <=3 |
+| `V` | very noisy | Spatial sigma >=5, or temporal coverage >20% and residual >3; replaces `N`, never both |
 | `D` | dark | Average luma < 32 |
 | `B` | crushed blacks | At least 15% of centre pixels have luma <= 18 |
 | `H` | clipped highlights | At least 5% of centre pixels have luma >= 233 |
 | `S` | saturated | Mean chroma magnitude >= 30 |
 
-For example, `22_low-good_F-VB_Movie.mp4` is very noisy with crushed blacks, while `10_1080p-good_F-DS_Movie.mp4` is dark and saturated. Letters label the existing measurements: they add no score penalty beyond the existing one-step heavy-noise adjustment.
+For example, `22_low-good_F-VB_Movie.mp4` is very noisy with crushed blacks, while `10_1080p-good_F-DS_Movie.mp4` is dark and saturated. Temporal noise requires a successful, current-version measurement. It lowers the grade one step for `N`, two for temporal `V`; the old spatial-heavy-noise penalty remains one step. Use the larger penalty, never their sum, with `poor` as the floor. The flag is the stronger of spatial/temporal evidence, so a spatial-only `V` still means a one-step penalty. Letters themselves add no further penalty.
 
 `F-` separates flags from titles such as `N_Movie.mp4`. A segment matching `F-<flag letters>_` immediately after the tier/grade is reserved for vqc. Legacy prefixes without flags remain supported.
 
@@ -70,7 +70,7 @@ Reruns replace the whole prefix, including old flags. Metadata-only `--rename` r
 
 ## How the code is decided
 
-The tier uses nominal resolution without `--deep`, and measured effective resolution with it. The grade uses codec-adjusted bitrate; heavy noise lowers it one step in deep mode. Neither label guarantees a particular visual appearance.
+The tier uses nominal resolution without `--deep`, and measured effective resolution with it. The grade uses codec-adjusted bitrate; noise can lower it by up to two steps in deep mode. Temporal checks now run automatically with `--deep`. Cached/forced reruns recompute from the original metadata grade, never an already penalized grade. Neither label guarantees a particular visual appearance.
 
 The formulas, thresholds and limitations live in [SCORING_TESTS.md](SCORING_TESTS.md). Installation, forced refresh and report pages live in [README.md](README.md).
 
