@@ -6,7 +6,9 @@ Group a video library by resolution and compression quality rather than file siz
 
 | Guide | Details |
 |---|---|
-| [Scoring checks and tests](SCORING_TESTS.md) | Measurements, thresholds, NumPy picture statistics, limitations, calibration results and validation |
+| [Implemented quality checks](SCORING_TESTS.md) | Current measurements, thresholds, NumPy picture statistics, limitations and completed validation |
+| [Research](research.md) | Broader quality dimensions, alternatives, evidence and selection rationale |
+| [Implementation plan](plan.md) | Approved prototype scope, phase progress, validation gates and private evaluation |
 | [Quality codes and renaming](QUALITY_CODES.md) | All 24 filename codes, prefix replacement, subtitles, conflicts and undo |
 | This README | Installation, commands, report pages, cache and network-drive operation |
 
@@ -32,6 +34,7 @@ uv run vqc /lib --deep                  # picture checks too
 uv run vqc /lib --deep -o ~/lib.md       # choose the report location
 uv run vqc /lib --deep --rename         # prefix videos and sidecars by quality
 uv run vqc /lib --deep --force --rename # recheck already-renamed videos
+uv run vqc /lib --noise-diagnostics -j 2 # experimental local spatial review; no new score penalties
 ```
 
 ## Command-line options
@@ -45,7 +48,8 @@ uv run vqc /lib --deep --force --rename # recheck already-renamed videos
 | `--force` | off | Purge scanned videos' old cache entries and reanalyse them |
 | `--ext LIST` | common video types | Extension filter, e.g. `mkv,mp4` |
 | `--deep` | off | Measure effective resolution, noise, brightness and colour flags |
-| `--frames N` | 8 | Requested sample count per video with `--deep` |
+| `--noise-diagnostics` | off | Opt-in multi-scale spatial luma/chroma review; grades and flags unchanged |
+| `--frames N` | 8 | Requested sample count with `--deep` or `--noise-diagnostics` |
 | `--rename` | off | Apply the quality prefix, including `F-` picture-flag letters in deep mode; see [renaming rules](QUALITY_CODES.md#renaming-rules) |
 | `--resdet PATH` | `<venv>/bin/resdet` | Override the auto-built binary; a missing/non-executable path is an error |
 | `-h`, `--help` | | Show help |
@@ -70,6 +74,14 @@ Each detail page has at most 200 video rows, with links to the overview and adja
 Tables show the file, display dimensions (including phone rotation), codec, bitrate, normalised bpp, duration and size. Deep reports add effective dimensions, detail, noise, diagnostic flags and a snapshot. Each snapshot is one image containing a scaled whole frame beside a 1:1 centre crop, with the sample timestamp in its tooltip. See [scoring details](SCORING_TESTS.md) for column interpretation.
 
 Snapshots are exposed through `vqc_snapshots/` beside the reports, so Markdown previews can load them locally. Move that folder with the reports if needed; its symlinks still require the cached images.
+
+### Experimental noise review
+
+`--noise-diagnostics` writes an additional `<report stem>_noise.md`, ordered by experimental spatial variation, with pages of at most 200 videos. It measures native-pixel SDR variation at several scales, not temporal noise or universal perceptual quality. Look at eligibility/status as well as the number; texture and intentional grain can produce high variation.
+
+Known-range, tagged SDR YUV/grayscale sources up to 4K pixel count are supported. Unknown transfer/range and HDR produce explicit unsupported status. No scores or `F-` flags are changed. Diagnostic details, including per-sample/channel/scale/brightness/region results, stay in the local cache.
+
+This mode never downloads resdet or models, and restricts source probing/decoding to local file/pipe protocols. If combined with `--deep`, only an already-installed or explicitly provided resdet is used; otherwise existing deep scoring uses SSIM alone. Omit `--rename` to keep the evaluation read-only. See [plan.md](plan.md) for evaluation and gates.
 
 ## Cache and forced refresh
 
@@ -99,7 +111,7 @@ Snapshots are exposed through `vqc_snapshots/` beside the reports, so Markdown p
 ## Development checks
 
 ```bash
-uv run python -m unittest -v test_vqc
+uv run python -m unittest -v test_vqc test_noise_diagnostics
 ```
 
 See [validation and calibration](SCORING_TESTS.md#validation-tests-distinct-from-scoring-checks) for what these tests prove and what they do not.

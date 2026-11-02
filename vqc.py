@@ -15,6 +15,10 @@ blurry or upscaled files are grouped by the detail they really contain:
     exact source height of upscales.
   * picture stats: noise (heavy noise/grain lowers the grade one step), brightness, clipping and
     saturation, reported as flags.
+
+--noise-diagnostics adds an experimental local spatial luma/chroma review without new
+score or filename penalties. In this mode resdet is never downloaded or auto-built,
+even with --deep; only an installed or explicitly provided binary is used.
 """
 import argparse
 import errno
@@ -35,9 +39,12 @@ import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import BoundedSemaphore
 
 import numpy as np
 from tqdm import tqdm
+
+import noise_diagnostics
 
 VIDEO_EXTS = {
     ".mp4", ".m4v", ".mkv", ".avi", ".mov", ".wmv", ".asf", ".flv", ".webm", ".mpg", ".mpeg",
@@ -82,8 +89,10 @@ RESDET_URL = f"https://github.com/0x09/resdet/archive/refs/tags/{RESDET_VERSION}
 # Keys are absolute path + size + mtime, so one cache serves every library.
 DEFAULT_CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache", "vqc", "cache.jsonl")
 
-def ffprobe(path):
+def ffprobe(path, offline=False):
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)]
+    if offline:
+        cmd[1:1] = ["-protocol_whitelist", "file,pipe"]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if out.returncode != 0:
         raise RuntimeError(out.stderr.strip().splitlines()[-1] if out.stderr.strip() else "ffprobe failed")
@@ -125,8 +134,8 @@ def _rotation(v):
     return -int((v.get("tags") or {}).get("rotate", 0)) % 360
 
 
-def analyze(path):
-    info = ffprobe(path)
+def analyze(path, offline=False):
+    info = ffprobe(path, offline=offline)
     streams = info.get("streams", [])
     fmt = info.get("format", {})
     vids = [s for s in streams if s.get("codec_type") == "video"
@@ -178,12 +187,14 @@ def analyze(path):
     }
 
 
-def _sample_frames(path, row, n, y4m):
+def _sample_frames(path, row, n, y4m, offline=False):
     """Seek to n points (no full decode) and write one frame from each into a y4m file."""
     dur = row["_duration_s"]
     times = [dur * (0.05 + 0.9 * (i + 0.5) / n) for i in range(n)] if dur > 2 else [0]
     cmd, chains = ["ffmpeg", "-v", "error", "-y"], ""
     for i, t in enumerate(times):
+        if offline:
+            cmd += ["-protocol_whitelist", "file,pipe"]
         cmd += ["-noautorotate", "-noaccurate_seek", "-ss", f"{t:.2f}", "-t", "2", "-i", str(path)]
         chains += f"[{i}:{row['_vstream']}]trim=end_frame=1,setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{i}];"
     fc = chains + "".join(f"[v{i}]" for i in range(len(times))) + f"concat=n={len(times)}:v=1:a=0[out]"
@@ -305,7 +316,7 @@ SNAP_H, SNAP_CROP_W = 270, 480
 TRANSPOSE = {90: "transpose=cclock,", 180: "hflip,vflip,", 270: "transpose=clock,"}
 
 
-def deep_analyze(row, n_frames, resdet, snap):
+def deep_analyze(row, n_frames, resdet, snap, offline=False):
     """snap: JPEG path for a strip of the deciding sampled frame: whole frame scaled down | 1:1 centre crop
     (shows real sharpness). Reuses the already decoded frames."""
     w, h = row["width"], row["height"]
@@ -314,7 +325,7 @@ def deep_analyze(row, n_frames, resdet, snap):
     pick = lambda vals: vals[pick_i(vals)]
     with tempfile.TemporaryDirectory(prefix="vqc_") as tmp:
         y4m = f"{tmp}/s.y4m"
-        times = _sample_frames(row["path"], row, n_frames, y4m)
+        times = _sample_frames(row["path"], row, n_frames, y4m, offline=offline)
         per_scale = _roundtrip_ssim(y4m, w, h, tmp)
         rd_h = _resdet_height(resdet, y4m, h) if resdet else None
         stats = _picture_stats(y4m)
@@ -379,7 +390,7 @@ def _md(text):
 REPORT_PAGE_SIZE = 200
 
 
-def write_report(path, root, groups, errors, options, snaps):
+def write_report(path, root, groups, errors, options, snaps, diagnostics=False):
     """Markdown report: options, summary per group, then one table per group (best norm_bpp first).
     snaps: folder (relative to the report) holding --deep snapshots, or None."""
     total = sum(len(rs) for rs in groups.values())
@@ -399,7 +410,8 @@ def write_report(path, root, groups, errors, options, snaps):
                 navigation.append(f"[Previous]({urllib.parse.quote(parts[i - 1].name)})")
             if i + 1 < len(parts):
                 navigation.append(f"[Next]({urllib.parse.quote(parts[i + 1].name)})")
-            write_report(part, root, page_groups, [], options + [("navigation", " · ".join(navigation))], snaps)
+            write_report(part, root, page_groups, [], options + [("navigation", " · ".join(navigation))],
+                         snaps, diagnostics=diagnostics)
     out = ["# Video quality report", "", f"`{root}` · {total} files · {gb:.1f} GB · {time.strftime('%Y-%m-%d %H:%M')}",
            "", "## Options", "", "| option | value |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in options]
@@ -415,9 +427,13 @@ def write_report(path, root, groups, errors, options, snaps):
     deep = snaps is not None
     head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] \
         + (["effective", "detail", "noise", "flags", "snapshot"] if deep else []) + ["min", "MB"]
+    if diagnostics:
+        head += ["quality", "spatial variation", "eligible tiles", "status", "source",
+                 "sample PTS/type", "evidence / reason"]
     for g, rs in (groups.items() if not parts else []):
         out += ["", f"## {g}", "", "| " + " | ".join(head) + " |",
-                "|---|---|---|--:|--:|" + ("--:|--:|--:|---|---|" if deep else "") + "--:|--:|"]
+                "|---|---|---|--:|--:|" + ("--:|--:|--:|---|---|" if deep else "") + "--:|--:|"
+                + ("---|--:|--:|---|---|---|---|" if diagnostics else "")]
         for r in rs:
             dw, dh = _display_size(r)
             cells = [_md(os.path.relpath(r["path"], root)), f"{dw}x{dh}", r["codec"],
@@ -429,6 +445,15 @@ def write_report(path, root, groups, errors, options, snaps):
                           f'![frame at {t // 60}:{t % 60:02d}]({snaps}/{r["snapshot"]} "frame at {t // 60}:{t % 60:02d}")'
                           if r.get("snapshot") else ""]
             cells += [r["duration_min"], round(r["size_mb"])]
+            if diagnostics:
+                d = r["_noise_diag"]
+                sample_times = ", ".join(f"{s['pts_s']:.3f}/{s['frame_type']}" for s in d.get("samples", []))
+                cells += [r["group"], d.get("review_score") if d.get("review_score") is not None else "",
+                          f"{d.get('coverage', 0):.1%}",
+                          _md(d["status"]), _md(f"{d.get('bit_depth', '?')}bit {d.get('range', '?')} "
+                                              f"{d.get('transfer', '?')}"),
+                          sample_times, _md(" ".join((d.get("evidence", ""),
+                                                     d.get("reason", "").replace("\n", " "))).strip())]
             out.append("| " + " | ".join(str(c) for c in cells) + " |")
     if errors:
         out += ["", "## Errors", "", "| file | error |", "|---|---|"]
@@ -619,12 +644,16 @@ def main():
     ap.add_argument("--ext", help="comma-separated extensions to include (default: common video types)")
     ap.add_argument("--deep", action="store_true",
                     help="sample frames to measure effective resolution (finds blurry/upscaled files; slower)")
-    ap.add_argument("--frames", type=int, default=8, help="frames sampled per file with --deep")
+    ap.add_argument("--noise-diagnostics", action="store_true",
+                    help="opt-in local multi-scale spatial luma/chroma review; never changes scores or flags")
+    ap.add_argument("--frames", type=int, default=8, help="samples per file with --deep or --noise-diagnostics")
     ap.add_argument("--rename", action="store_true",
                     help="prefix files with their quality rank, e.g. 10_1080p-good_Movie.mkv (see QUALITY_CODES.md)")
     ap.add_argument("--resdet", help="path to a resdet binary for exact upscale detection "
                     "(default: <venv>/bin/resdet, built automatically on first --deep run)")
     a = ap.parse_args()
+    if a.frames < 1 or a.jobs < 1:
+        ap.error("--frames and --jobs must be positive")
 
     if not in_uv_venv():
         sys.exit("vqc must run from its uv environment:\n"
@@ -636,7 +665,13 @@ def main():
     snap_dir = a.cache.parent / "snapshots"
     if a.deep:
         snap_dir.mkdir(parents=True, exist_ok=True)
-        a.resdet = a.resdet or ensure_resdet()
+        if a.noise_diagnostics:
+            a.resdet = a.resdet or shutil.which(str(Path(sys.prefix, "bin", "resdet")))
+            if not a.resdet:
+                print("noise diagnostics: no installed resdet; deep scoring uses SSIM only. "
+                      "No automatic downloads in this mode.", file=sys.stderr)
+        else:
+            a.resdet = a.resdet or ensure_resdet()
         if a.resdet:
             print(f"resdet: {a.resdet}", file=sys.stderr)
     root = a.root.resolve()
@@ -656,21 +691,36 @@ def main():
         if cached and "rotation" not in cached:  # from an older vqc version
             cached = None
         if cached and (not a.deep or (cached.get("snapshot") == snap_name(key) and "noise" in cached
-                                      and (snap_dir / snap_name(key)).is_file())):
+                                      and (snap_dir / snap_name(key)).is_file())) and (
+                not a.noise_diagnostics or (
+                    cached.get("_noise_diag", {}).get("signature") == noise_diagnostics.cache_signature(a.frames)
+                    and cached["_noise_diag"].get("status") != "error")):
             rows.append(cached)
         else:
             todo.append((f, key, cached))
     n_cached = len(rows)
+    diagnostic_slots = BoundedSemaphore(2)
 
     def work(f, key, cached):
-        r = cached or analyze(f)
-        if a.deep:
+        r = cached or (analyze(f, offline=True) if a.noise_diagnostics else analyze(f))
+        error = None
+        if a.deep and not (r.get("snapshot") == snap_name(key) and "noise" in r
+                           and (snap_dir / snap_name(key)).is_file()):
             try:
                 snap = snap_dir / snap_name(key)
-                r = {**r, **deep_analyze(r, a.frames, a.resdet, snap)}
+                r = {**r, **(deep_analyze(r, a.frames, a.resdet, snap, offline=True)
+                            if a.noise_diagnostics else deep_analyze(r, a.frames, a.resdet, snap))}
             except Exception as e:  # keep the metadata result if frame sampling fails
-                return r, f"deep: {e}"
-        return r, None
+                error = f"deep: {e}"
+        if a.noise_diagnostics:
+            try:
+                with diagnostic_slots:
+                    r = {**r, "_noise_diag": noise_diagnostics.analyze_noise(
+                        r, a.frames, ffprobe(f, offline=True))}
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+                r = {**r, "_noise_diag": {"signature": noise_diagnostics.cache_signature(a.frames),
+                                         "status": "error", "reason": str(e)}}
+        return r, error
 
     bar = progress(len(files), "deep" if a.deep else "probe", initial=n_cached)
     bar.set_postfix_str(f"cached {n_cached}, errors 0")
@@ -690,6 +740,9 @@ def main():
             bar.set_postfix_str(f"cached {n_cached}, errors {len(errors)} · {f.name[:40]}", refresh=False)
             bar.update()
 
+    if a.noise_diagnostics:
+        errors += [(Path(r["path"]), f"noise diagnostics: {r['_noise_diag']['reason']}")
+                   for r in rows if r["_noise_diag"]["status"] != "ok"]
     tier_rank = {n: i for i, (n, _) in enumerate(RES_TIERS)}
     grade_rank = {n: i for i, (n, _) in enumerate(GRADES)}
     # Without --deep, ignore deep results that may be in the cache so the report matches the options.
@@ -727,6 +780,15 @@ def main():
         ("cache", f"`{a.cache}`"),
         ("force", "yes (old entries purged; all scanned videos reanalyzed)" if a.force else "no"),
     ] + ([("snapshots", f"`{snap_dir}`")] if a.deep else []) + rename_info
+    if a.noise_diagnostics:
+        diagnostic_report = a.report.with_name(f"{a.report.stem}_noise{a.report.suffix}")
+        options.append(("noise diagnostics", f"[Local spatial review]({urllib.parse.quote(diagnostic_report.name)}) "
+                        "(experimental; scores and flags unchanged)"))
+        review_rows = sorted(rows, key=lambda r: (
+            r["_noise_diag"].get("review_score") is None,
+            -(r["_noise_diag"].get("review_score") or 0)))
+        write_report(diagnostic_report, root, {"Diagnostic review": review_rows}, [], options,
+                     None, diagnostics=True)
     write_report(a.report, root, groups, errors, options, link_snapshots(a.report, snap_dir, rows) if a.deep else None)
 
     print(f"\n{'group':<18}{'files':>7}{'size GB':>10}")

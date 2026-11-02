@@ -1,4 +1,6 @@
-# Checks used in video scoring
+# Implemented quality checks and validation
+
+**Status: implemented behaviour only.** This document describes [vqc.py](vqc.py), [noise_diagnostics.py](noise_diagnostics.py) and their tests. Broader areas and alternatives are in [research.md](research.md); implementation phases, progress and remaining gates are in [plan.md](plan.md).
 
 `vqc` assigns a **resolution tier** and a **grade**, not a single perceptual-quality score. Resolution ranks first: every 1080p group ranks above every 720p group. The bitrate grade is a compression heuristic, not proof that the picture is good.
 
@@ -38,6 +40,8 @@ The nominal resolution tier uses the 16:9-equivalent height `sqrt(width * height
 ## 2. Frame sampling: `--deep`
 
 By default, eight frames are sought at evenly spaced points between roughly 5% and 95% of the video's duration. Videos lasting at most two seconds, or with unknown duration, use one frame at time zero. `--frames N` changes the requested sample count.
+
+The implementation uses fast, non-accurate seeking and takes one decoded frame per position. It does not record the actual decoded timestamps or frame types for analysis, and the requested sample times may differ from the decoded frame times. These isolated samples are not consecutive-frame bursts.
 
 Frames are decoded to 8-bit YUV 4:2:0. The SSIM and picture-stat checks use a centre region about 70% of the width and 60% of the height to reduce the influence of black bars. This samples the video; it does not inspect every scene. HDR footage is not evaluated in its original HDR luminance space.
 
@@ -92,6 +96,8 @@ These checks are implemented locally with **NumPy**; ffmpeg decodes the sampled 
 
 Values are combined using the median over sampled frames. Heavily clipped or too-small regions can leave noise unavailable.
 
+In the existing scoring path, the noise filter excludes luma values <= 1 and >= 254; it does not adapt that eligibility mask to a limited-range black floor near 16. Its noise is measured only on Y, and quiet-block selection can hide other regions. The separate opt-in spatial diagnostic below does not replace this estimator. Temporal noise and calibrated affected-duration estimates are not implemented.
+
 | Check | Condition | Scoring effect |
 |---|---|---|
 | noisy | estimated noise sigma >= 3.5, in 8-bit levels | flag only |
@@ -107,19 +113,48 @@ With `--deep --rename`, these same flags become an optional `F-` letter segment 
 
 **Limitations:** intentional heavy film grain is penalised like unwanted noise. Night scenes may legitimately be dark. Vivid cartoons can trigger saturation flags. Colour manipulation cannot be established without a reference; a contrast/saturation boost may instead trigger crushed-black or clipping flags.
 
-There is no separate reliable banding, colour-fidelity, motion-artifact or artistic-quality score. ffmpeg `blockdetect` was investigated but is not part of scoring.
+There is no separate banding, blocking, ringing, freeze, cadence, flicker, ghosting, colour-fidelity or artistic-quality score. HDR transfer metadata is recorded, but there is no HDR-aware noise or perceptual-quality analysis. See [research coverage](research.md#quality-coverage-and-blind-spots) for the broader gaps and candidate methods.
 
 For commands, report pagination and forced refresh, see [README.md](README.md). For filename prefixes and undo, see [QUALITY_CODES.md](QUALITY_CODES.md).
+
+## 6. Experimental spatial diagnostics: opt-in, not scoring
+
+`--noise-diagnostics` runs a separate local NumPy/ffmpeg path. It does not change the old sampler, noise estimate, grades, groups or filename flags.
+
+| Step | Implemented behaviour |
+|---|---|
+| Accurate sampling | Seek to up to `--frames` positions, trim one frame, record requested/source-relative time, actual PTS, frame type and keyframe flag; exclude duplicate PTS |
+| Representation | Inspect source pixel depth/range/transfer/SAR; explicitly preserve range while converting to 16-bit YUV 4:2:0, then normalize code values |
+| Supported input | Tagged SDR, known `tv`/`pc` range, 8-16-bit YUV/grayscale, at most 3840 x 2160 pixels in either orientation |
+| Unsupported input | Unknown transfer/range, HDR or other unsupported representation is reported explicitly, not assigned zero disturbance |
+| Spatial selection | Whole-frame 32x32 luma tiles (16x16 corresponding chroma), at native, 2x and 4x area-averaged scales |
+| Eligibility | At least 95% of luma pixels between normalized 2/255 and 253/255; quadrant-mean residual spread below 4/255 after planar detrending |
+| Variation | Fit/remove each tile's planar gradient; measure median absolute residual deviation x 1.4826 x 255 separately for Y/U/V |
+| Distributions | Median/p90, shadow/midtone/highlight bands, four spatial regions and eligible-tile coverage per sample/scale/channel |
+| Review ordering | 90th percentile of available sample/scale/channel p90 values; descriptive evidence coverage, not calibrated confidence |
+| Bounds | One frame at a time per diagnostic worker; at most two diagnostic workers, single-threaded diagnostic decoding/filtering, 30-second decode timeout and 120-second per-file diagnostic budget |
+
+The source precision is not reduced to 8 bits, but the analysis uses 4:2:0 chroma and native luma geometry, not every source's original chroma layout. No HDR linearization, temporal differencing, motion compensation, noise-versus-texture classifier or display-scale perceptual model is implemented.
+
+Flat black/white regions do not establish cleanliness: if no eligible tiles exist, the status is **insufficient evidence**. Other statuses are **ok**, **unsupported** and **error**. Eligibility coverage is a fraction of measured tiles, not the fraction of the video's duration affected by noise.
+
+The separate `_noise.md` report is ordered for review and has at most 200 videos per page. The private local cache stores detailed distributions and the algorithm-version/sample-count signature. Metadata/deep caches are upgraded only when needed; incompatible or failed diagnostic entries are not silently reused as successful results.
+
+High spatial variation can be genuine texture or intentional grain. Conversely, the luma structure gate can reject severely disturbed areas; low eligibility must be inspected, not treated as a confident clean result. This prototype is evidence for local review, not a validated sensor-noise or general quality score.
+
+Diagnostics introduce no dependency or model download. Source probing and decoding are restricted to local file/pipe protocols in this mode, including existing deep sampling when combined with diagnostics. When combined with `--deep`, only an installed/explicit resdet is used. Original files stay unchanged unless the user separately requests normal `--rename`.
 
 ## Validation tests, distinct from scoring checks
 
 Run the automated regressions with:
 
 ```bash
-uv run python -m unittest -v test_vqc
+uv run python -m unittest -v test_vqc test_noise_diagnostics
 ```
 
 [test_vqc.py](test_vqc.py) covers SSIM/resdet combination boundaries, controlled noise measurement, YUV picture statistics, flag thresholds, cached reporting and repeated renaming. Workflow tests use temporary files and controlled detector results rather than real video decoding. Force-refresh tests cover cache purging, fresh processing and failure handling. Report tests check page boundaries, a maximum of 200 pictures per file, complete row coverage and navigation.
+
+[test_noise_diagnostics.py](test_noise_diagnostics.py) adds controlled correlated-luma and chroma-only noise, smooth gradients, black-floor rejection, explicit unsupported representation, lossless real 8/10-bit full/limited-range decoding, actual PTS/non-keyframes and offset timestamps, duplicate exclusion on a one-frame black clip, local-protocol/decoder-thread restrictions, default-score preservation, cache upgrades/version changes/failures and diagnostic pagination. The controlled range test allows 0.4 8-bit-equivalent levels of p90 variation across quantized versions of the same perturbation; it also checks decoded normalized pixel values. This is not a codec-independent accuracy guarantee.
 
 The separate real-video calibration challenge used two Xiph 1080p camera sequences, crowd_run and park_joy, with 15 variants each: originals, mild/strong blur, 540p and 720p upscales, grain, grain after upscaling, sharpening after blur, darkness, dark noise, contrast/saturation changes, colour casts, strong denoising, and blocky low-bitrate material re-encoded at high bitrate.
 
@@ -155,23 +190,3 @@ The 30-video challenge used x264 CRF 16; all variants were excellent by bitrate 
 | CRF 44 blocky encode re-encoded at high bitrate | low; bitrate grade remains excellent |
 
 The colour-boosted park_joy clip triggered dark/crushed-black flags, not saturation: this illustrates why these flags are diagnostics rather than proof of manipulation.
-
-### Other methods investigated
-
-| Method | Why it was not used |
-|---|---|
-| ffmpeg blurdetect | Tracked scene content more than blur |
-| ffmpeg blockdetect | Weak separation; a colour-cast clip scored higher than real blocking |
-| DOVER | Rated 720p upscales above originals in four tested scenes |
-| pyiqa TOPIQ / MUSIQ | Scores overlapped across scenes and favoured denoised copies |
-| pyiqa Q-Align | Resized to 448 pixels, obscuring resolution loss; about 100 seconds per crop on CPU |
-
-The tested PyTorch models also require substantial compute and have non-commercial licensing restrictions.
-
-### Sources
-
-- [Streaming Learning Center: Power of .75 rule](https://streaminglearningcenter.com/blogs/five-checks-for-your-encoding-ladder.html): resolution normalisation and typical H.264 bpp.
-- Wikipedia codec articles: [HEVC](https://en.wikipedia.org/wiki/High_Efficiency_Video_Coding), [AV1](https://en.wikipedia.org/wiki/AV1), [AVC](https://en.wikipedia.org/wiki/Advanced_Video_Coding).
-- [resdet](https://github.com/0x09/resdet): resizing-trace detection.
-- [Video quality tools overview](https://www.forasoft.com/learn/video-quality/articles-vqm/open-source-no-reference-tools).
-- [video-quality-scanner](https://github.com/sisyphosloughs/video-quality-scanner): a related resolution-based library tool.
