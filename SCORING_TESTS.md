@@ -96,7 +96,7 @@ These checks are implemented locally with **NumPy**; ffmpeg decodes the sampled 
 
 Values are combined using the median over sampled frames. Heavily clipped or too-small regions can leave noise unavailable.
 
-In the existing scoring path, the noise filter excludes luma values <= 1 and >= 254; it does not adapt that eligibility mask to a limited-range black floor near 16. Its noise is measured only on Y, and quiet-block selection can hide other regions. The separate opt-in spatial diagnostic below does not replace this estimator. Temporal noise and calibrated affected-duration estimates are not implemented.
+In the existing scoring path, the noise filter excludes luma values <= 1 and >= 254; it does not adapt that eligibility mask to a limited-range black floor near 16. Its noise is measured only on Y, and quiet-block selection can hide other regions. The separate opt-in temporal diagnostic below does not replace this estimator or its penalty. Calibrated noise severity and affected-duration estimates are not implemented.
 
 | Check | Condition | Scoring effect |
 |---|---|---|
@@ -117,30 +117,36 @@ There is no separate banding, blocking, ringing, freeze, cadence, flicker, ghost
 
 For commands, report pagination and forced refresh, see [README.md](README.md). For filename prefixes and undo, see [QUALITY_CODES.md](QUALITY_CODES.md).
 
-## 6. Experimental spatial diagnostics: opt-in, not scoring
+## 6. Experimental temporal diagnostics: opt-in, not scoring
 
-`--noise-diagnostics` runs a separate local NumPy/ffmpeg path. It does not change the old sampler, noise estimate, grades, groups or filename flags.
+`--noise-diagnostics` runs a separate local NumPy/ffmpeg path. It does not change the old deep sampler, noise estimate, grades, groups or filename flags, and does not apply a denoising filter to files. The former experimental spatial detector was removed: private evaluation found clean fine-detail false positives at high eligibility. Algorithm version 2 automatically replaces version-1 diagnostic cache entries.
 
 | Step | Implemented behaviour |
 |---|---|
-| Accurate sampling | Seek to up to `--frames` positions, trim one frame, record requested/source-relative time, actual PTS, frame type and keyframe flag; exclude duplicate PTS |
+| Accurate sampling | Seek to up to `--frames` positions; decode four consecutive frames per burst; record requested/source-relative time, PTS and frame type; deduplicate positions, frames and comparisons |
 | Representation | Inspect source pixel depth/range/transfer/SAR; explicitly preserve range while converting to 16-bit YUV 4:2:0, then normalize code values |
 | Supported input | Tagged SDR, known `tv`/`pc` range, 8-16-bit YUV/grayscale, at most 3840 x 2160 pixels in either orientation |
 | Unsupported input | Unknown transfer/range, HDR or other unsupported representation is reported explicitly, not assigned zero disturbance |
-| Spatial selection | Whole-frame 32x32 luma tiles (16x16 corresponding chroma), at native, 2x and 4x area-averaged scales |
-| Eligibility | At least 95% of luma pixels between normalized 2/255 and 253/255; quadrant-mean residual spread below 4/255 after planar detrending |
-| Variation | Fit/remove each tile's planar gradient; measure median absolute residual deviation x 1.4826 x 255 separately for Y/U/V |
-| Distributions | Median/p90, shadow/midtone/highlight bands, four spatial regions and eligible-tile coverage per sample/scale/channel |
-| Review ordering | 90th percentile of available sample/scale/channel p90 values; descriptive evidence coverage, not calibrated confidence |
-| Bounds | One frame at a time per diagnostic worker; at most two diagnostic workers, single-threaded diagnostic decoding/filtering, 30-second decode timeout and 120-second per-file diagnostic budget |
+| Alignment | NumPy phase correlation on a luma pyramid plus integer refinement, bounded to 32 native pixels per axis; retry a native central patch (up to 512x512) when coarse averaging hides fine detail; reject ambiguous estimates, with a low-contrast fallback |
+| Chroma alignment | Only measure chroma for even-pixel luma translations; odd translations omit U/V rather than interpolating detail into residuals |
+| Timing/repeats | Reject nonpositive or >2.5 nominal-frame-interval gaps; identical decoded Y/U/V pairs are counted separately, not assigned zero noise |
+| Exposure/cuts | Reject median luma change >2/255 without silently removing it; reject median absolute 8x8-averaged residual >12/255 |
+| Tile selection | 32x32 luma / 16x16 chroma tiles at native, 2x and 4x scales; at least 95% unclipped luma pixels in both frames; maximum local averaged change <3/255 |
+| Motion rejection | Reject edge-correlated residuals (correlation >=0.25 above a 0.05/255 residual RMS floor); require coarse tile correlation >=0.8 where coarse structure is >=2/255; chroma has its own structure/change rejection; coarser scales also require >=75% native-tile eligibility so downsampling cannot resurrect rejected motion |
+| Temporal residual | Subtract aligned adjacent frames; median absolute deviation about each difference tile's median x 1.4826 x 255, separately for Y/U/V; no spatial-variation score |
+| Distributions | Median/p90 and shadow/midtone/highlight bands per pair/scale/channel, plus alignment, signed exposure delta, rejection reasons and frame timing |
+| Review ordering | Maximum available scale/channel p90 per pair; median across at least two measured pairs per burst; 90th percentile across scored bursts |
+| Bounds | Four-frame temporary local decode file; two normalized frames needed for each comparison; at most two workers, single-threaded diagnostic decoding/filtering, 30-second decode timeout and 120-second per-file diagnostic budget |
 
-The source precision is not reduced to 8 bits, but the analysis uses 4:2:0 chroma and native luma geometry, not every source's original chroma layout. No HDR linearization, temporal differencing, motion compensation, noise-versus-texture classifier or display-scale perceptual model is implemented.
+These rejection constants are prototype reliability rules, not calibrated quality thresholds. Mostly unchanged luma means the 90th percentile of absolute median-centered frame differences is <0.05/255. Only when coarse-luma standard deviation is <2/255 in both frames, native-patch alignment fails, and native-patch contrast is <8/255 in both frames does alignment fall back to zero displacement. This cannot establish camera motion in low-contrast fields.
 
-Flat black/white regions do not establish cleanliness: if no eligible tiles exist, the status is **insufficient evidence**. Other statuses are **ok**, **unsupported** and **error**. Eligibility coverage is a fraction of measured tiles, not the fraction of the video's duration affected by noise.
+The source precision is not reduced to 8 bits, but analysis uses 4:2:0 chroma. There is no HDR linearization, fractional-pixel warp, local optical flow, rotation/zoom compensation or display-scale perceptual model. Global translation only aligns some moving footage; unreliable local regions must abstain.
 
-The separate `_noise.md` report is ordered for review and has at most 200 videos per page. The private local cache stores detailed distributions and the algorithm-version/sample-count signature. Metadata/deep caches are upgraded only when needed; incompatible or failed diagnostic entries are not silently reused as successful results.
+Flat black/white regions, repeats or too few matched frames do not establish cleanliness: fewer than two measured pairs in every burst yields **insufficient evidence**, with no review score. Other statuses are **ok**, **unsupported** and **error**. Reliable coverage counts accepted luma tiles over attempted pairs/scales, including rejected/repeated pairs in the denominator; it is not confidence or affected-video duration. Chroma eligibility can be lower and is recorded separately in the cache.
 
-High spatial variation can be genuine texture or intentional grain. Conversely, the luma structure gate can reject severely disturbed areas; low eligibility must be inspected, not treated as a confident clean result. This prototype is evidence for local review, not a validated sensor-noise or general quality score.
+The separate `_noise.md` report has at most 200 videos per page. Metadata/deep caches are preserved on diagnostic upgrades; incompatible or failed diagnostic entries are not reused as successful results.
+
+Stable detail should cancel, but independent motion, interpolation, compression and intentional grain can still produce residuals. Severe/coarse noise can fail motion-reliability gates, and temporally persistent/frozen noise can have low residuals. Exact decoded repeats are counted, but there is no general freeze or periodic-refresh detector. This is experimental evidence for playback review, not proof of noise, cleanliness, sensor sigma or overall quality.
 
 Diagnostics introduce no dependency or model download. Source probing and decoding are restricted to local file/pipe protocols in this mode, including existing deep sampling when combined with diagnostics. When combined with `--deep`, only an installed/explicit resdet is used. Original files stay unchanged unless the user separately requests normal `--rename`.
 
@@ -154,7 +160,7 @@ uv run python -m unittest -v test_vqc test_noise_diagnostics
 
 [test_vqc.py](test_vqc.py) covers SSIM/resdet combination boundaries, controlled noise measurement, YUV picture statistics, flag thresholds, cached reporting and repeated renaming. Workflow tests use temporary files and controlled detector results rather than real video decoding. Force-refresh tests cover cache purging, fresh processing and failure handling. Report tests check page boundaries, a maximum of 200 pictures per file, complete row coverage and navigation.
 
-[test_noise_diagnostics.py](test_noise_diagnostics.py) adds controlled correlated-luma and chroma-only noise, smooth gradients, black-floor rejection, explicit unsupported representation, lossless real 8/10-bit full/limited-range decoding, actual PTS/non-keyframes and offset timestamps, duplicate exclusion on a one-frame black clip, local-protocol/decoder-thread restrictions, default-score preservation, cache upgrades/version changes/failures and diagnostic pagination. The controlled range test allows 0.4 8-bit-equivalent levels of p90 variation across quantized versions of the same perturbation; it also checks decoded normalized pixel values. This is not a codec-independent accuracy guarantee.
+[test_noise_diagnostics.py](test_noise_diagnostics.py) checks stable fine detail, integer translation, subpixel/local-motion rejection, independent luma/chroma noise and correlated disturbance, smooth gradients, black-floor rejection, repeats/refresh and bad timing, and unsupported sources. Actual 4K arrays verify that fine-detail translation cancels and half-pixel motion remains rejected at every scale. Encoded detailed clean/moving controls must stay below 2 residual levels while injected luma/chroma noise exceeds 4 and more than twice the clean controls; these are fixture acceptance checks, not real-library thresholds. Real 8/10-bit full/limited-range fixtures are checked against independently computed quantized temporal residuals (within 0.05 levels) and decoded normalized pixels. Integration tests cover consecutive PTS/non-keyframes, source offsets, short clips, local protocols/decoder threads, default-score preservation, version-1 cache migration, upgrades/failures and pagination. These tests do not establish real-phone accuracy.
 
 The separate real-video calibration challenge used two Xiph 1080p camera sequences, crowd_run and park_joy, with 15 variants each: originals, mild/strong blur, 540p and 720p upscales, grain, grain after upscaling, sharpening after blur, darkness, dark noise, contrast/saturation changes, colour casts, strong denoising, and blocky low-bitrate material re-encoded at high bitrate.
 

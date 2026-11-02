@@ -34,7 +34,7 @@ uv run vqc /lib --deep                  # picture checks too
 uv run vqc /lib --deep -o ~/lib.md       # choose the report location
 uv run vqc /lib --deep --rename         # prefix videos and sidecars by quality
 uv run vqc /lib --deep --force --rename # recheck already-renamed videos
-uv run vqc /lib --noise-diagnostics -j 2 # experimental local spatial review; no new score penalties
+uv run vqc /lib --noise-diagnostics -j 2 # experimental local temporal review; no new score penalties
 ```
 
 ## Command-line options
@@ -48,8 +48,8 @@ uv run vqc /lib --noise-diagnostics -j 2 # experimental local spatial review; no
 | `--force` | off | Purge scanned videos' old cache entries and reanalyse them |
 | `--ext LIST` | common video types | Extension filter, e.g. `mkv,mp4` |
 | `--deep` | off | Measure effective resolution, noise, brightness and colour flags |
-| `--noise-diagnostics` | off | Opt-in multi-scale spatial luma/chroma review; grades and flags unchanged |
-| `--frames N` | 8 | Requested sample count with `--deep` or `--noise-diagnostics` |
+| `--noise-diagnostics` | off | Opt-in motion-aligned temporal luma/chroma review; grades and flags unchanged |
+| `--frames N` | 8 | Sample positions: one frame per position with `--deep`, four consecutive frames per position with diagnostics |
 | `--rename` | off | Apply the quality prefix, including `F-` picture-flag letters in deep mode; see [renaming rules](QUALITY_CODES.md#renaming-rules) |
 | `--resdet PATH` | `<venv>/bin/resdet` | Override the auto-built binary; a missing/non-executable path is an error |
 | `-h`, `--help` | | Show help |
@@ -77,9 +77,22 @@ Snapshots are exposed through `vqc_snapshots/` beside the reports, so Markdown p
 
 ### Experimental noise review
 
-`--noise-diagnostics` writes an additional `<report stem>_noise.md`, ordered by experimental spatial variation, with pages of at most 200 videos. It measures native-pixel SDR variation at several scales, not temporal noise or universal perceptual quality. Look at eligibility/status as well as the number; texture and intentional grain can produce high variation.
+`--noise-diagnostics` writes an additional `<report stem>_noise.md`, ordered by experimental **temporal residual**, with pages of at most 200 videos. The former spatial-variation diagnostic was removed after private testing showed clean fine detail ranking highly despite high eligibility. Its version-1 cache entries refresh automatically; `--force` is not needed for this upgrade.
 
-Known-range, tagged SDR YUV/grayscale sources up to 4K pixel count are supported. Unknown transfer/range and HDR produce explicit unsupported status. No scores or `F-` flags are changed. Diagnostic details, including per-sample/channel/scale/brightness/region results, stay in the local cache.
+The replacement compares adjacent frames within four-frame bursts, estimates integer camera translation, and measures Y/U/V residuals only in plausibly matched tiles. Stable fine detail cancels instead of contributing a spatial score. Cuts, exposure changes, unreliable local structure and exact repeats are excluded or reported separately. This does not denoise or modify videos.
+
+| Report field | Interpretation |
+|---|---|
+| temporal residual | Robust changing-image signal, in 8-bit-equivalent levels; higher warrants playback review, with no validated good/bad threshold |
+| reliable coverage | Accepted luma tiles across attempted pairs/scales, not affected duration or calibrated confidence |
+| pairs measured/rejected/repeated | Counts of usable comparisons, rejected comparisons and identical decoded frame pairs |
+| status | `ok` means a measurement exists, not good quality; blank residual / insufficient evidence, unsupported or error never mean clean |
+
+At least two measured pairs in one burst are required to produce a review score. Repeated/frozen noisy content can have little temporal change; no low score proves cleanliness. Complex/subpixel motion, changing lighting, intentional grain and compression remain confounds. Start with a small subset including your previous clean-detail false positives and known noisy clips.
+
+Known-range, tagged SDR YUV/grayscale sources up to 4K pixel count are supported. Unknown transfer/range and HDR produce explicit unsupported status. No scores or `F-` flags are changed, and the older `--deep` noise estimate/penalty is preserved. Diagnostic details, including frame timestamps/types, pair shifts/rejections/exposure deltas and channel/scale/brightness results, stay in the local cache.
+
+Eight positions can decode up to 32 frames per video, with at most two diagnostic workers. Temporary decoded frames are local and automatically removed; allow approximately 100 MB temporary disk space per active 4K worker in addition to processing memory. This is slower than isolated spatial samples; use `--frames 3 -j 1` for a smaller first trial, with reduced sampling coverage.
 
 This mode never downloads resdet or models, and restricts source probing/decoding to local file/pipe protocols. If combined with `--deep`, only an already-installed or explicitly provided resdet is used; otherwise existing deep scoring uses SSIM alone. Omit `--rename` to keep the evaluation read-only. See [plan.md](plan.md) for evaluation and gates.
 

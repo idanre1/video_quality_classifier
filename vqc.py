@@ -16,7 +16,7 @@ blurry or upscaled files are grouped by the detail they really contain:
   * picture stats: noise (heavy noise/grain lowers the grade one step), brightness, clipping and
     saturation, reported as flags.
 
---noise-diagnostics adds an experimental local spatial luma/chroma review without new
+--noise-diagnostics adds an experimental local temporal luma/chroma review without new
 score or filename penalties. In this mode resdet is never downloaded or auto-built,
 even with --deep; only an installed or explicitly provided binary is used.
 """
@@ -412,8 +412,17 @@ def write_report(path, root, groups, errors, options, snaps, diagnostics=False):
                 navigation.append(f"[Next]({urllib.parse.quote(parts[i + 1].name)})")
             write_report(part, root, page_groups, [], options + [("navigation", " · ".join(navigation))],
                          snaps, diagnostics=diagnostics)
-    out = ["# Video quality report", "", f"`{root}` · {total} files · {gb:.1f} GB · {time.strftime('%Y-%m-%d %H:%M')}",
-           "", "## Options", "", "| option | value |", "|---|---|"]
+    out = ["# Temporal noise diagnostic review" if diagnostics else "# Video quality report", "",
+           f"`{root}` · {total} files · {gb:.1f} GB · {time.strftime('%Y-%m-%d %H:%M')}"]
+    if diagnostics:
+        out += ["", "Experimental aligned consecutive-frame residuals, not the old spatial-variation score. "
+                "Higher values are candidates for playback review, not calibrated noise severity.",
+                "Reliable coverage counts accepted luma tiles across attempted frame pairs, not affected duration "
+                "or detection confidence. Pair counts are measured / rejected / repeated.",
+                "Repeated frames, rejected motion/exposure changes, and insufficient evidence do not establish "
+                "cleanliness. Fine static detail should cancel; complex motion, grain and compression can still confound this test.",
+                "Scores, existing deep noise flags, grades and filenames are unchanged by this diagnostic."]
+    out += ["", "## Options", "", "| option | value |", "|---|---|"]
     out += [f"| {k} | {v} |" for k, v in options]
     out += ["", "## Summary", "", "| group | files | size GB |", "|---|--:|--:|"]
     for g, rs in groups.items():
@@ -428,12 +437,12 @@ def write_report(path, root, groups, errors, options, snaps, diagnostics=False):
     head = ["file", "resolution", "codec", "Mb/s", "norm bpp"] \
         + (["effective", "detail", "noise", "flags", "snapshot"] if deep else []) + ["min", "MB"]
     if diagnostics:
-        head += ["quality", "spatial variation", "eligible tiles", "status", "source",
-                 "sample PTS/type", "evidence / reason"]
+        head += ["quality", "temporal residual", "reliable coverage", "pairs measured/rejected/repeated",
+                 "status", "source", "sample PTS/type", "evidence / reason"]
     for g, rs in (groups.items() if not parts else []):
         out += ["", f"## {g}", "", "| " + " | ".join(head) + " |",
                 "|---|---|---|--:|--:|" + ("--:|--:|--:|---|---|" if deep else "") + "--:|--:|"
-                + ("---|--:|--:|---|---|---|---|" if diagnostics else "")]
+                + ("---|--:|--:|---|---|---|---|---|" if diagnostics else "")]
         for r in rs:
             dw, dh = _display_size(r)
             cells = [_md(os.path.relpath(r["path"], root)), f"{dw}x{dh}", r["codec"],
@@ -450,6 +459,7 @@ def write_report(path, root, groups, errors, options, snaps, diagnostics=False):
                 sample_times = ", ".join(f"{s['pts_s']:.3f}/{s['frame_type']}" for s in d.get("samples", []))
                 cells += [r["group"], d.get("review_score") if d.get("review_score") is not None else "",
                           f"{d.get('coverage', 0):.1%}",
+                          f"{d.get('measured_pairs', 0)}/{d.get('rejected_pairs', 0)}/{d.get('repeated_pairs', 0)}",
                           _md(d["status"]), _md(f"{d.get('bit_depth', '?')}bit {d.get('range', '?')} "
                                               f"{d.get('transfer', '?')}"),
                           sample_times, _md(" ".join((d.get("evidence", ""),
@@ -645,8 +655,9 @@ def main():
     ap.add_argument("--deep", action="store_true",
                     help="sample frames to measure effective resolution (finds blurry/upscaled files; slower)")
     ap.add_argument("--noise-diagnostics", action="store_true",
-                    help="opt-in local multi-scale spatial luma/chroma review; never changes scores or flags")
-    ap.add_argument("--frames", type=int, default=8, help="samples per file with --deep or --noise-diagnostics")
+                    help="opt-in aligned temporal luma/chroma review; never changes scores or flags")
+    ap.add_argument("--frames", type=int, default=8,
+                    help="sample positions per file: single frames with --deep, four-frame bursts with --noise-diagnostics")
     ap.add_argument("--rename", action="store_true",
                     help="prefix files with their quality rank, e.g. 10_1080p-good_Movie.mkv (see QUALITY_CODES.md)")
     ap.add_argument("--resdet", help="path to a resdet binary for exact upscale detection "
@@ -782,8 +793,8 @@ def main():
     ] + ([("snapshots", f"`{snap_dir}`")] if a.deep else []) + rename_info
     if a.noise_diagnostics:
         diagnostic_report = a.report.with_name(f"{a.report.stem}_noise{a.report.suffix}")
-        options.append(("noise diagnostics", f"[Local spatial review]({urllib.parse.quote(diagnostic_report.name)}) "
-                        "(experimental; scores and flags unchanged)"))
+        options.append(("noise diagnostics", f"[Local temporal review]({urllib.parse.quote(diagnostic_report.name)}) "
+                        "(four-frame bursts; experimental; scores and flags unchanged)"))
         review_rows = sorted(rows, key=lambda r: (
             r["_noise_diag"].get("review_score") is None,
             -(r["_noise_diag"].get("review_score") or 0)))

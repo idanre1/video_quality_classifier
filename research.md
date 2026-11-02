@@ -13,7 +13,7 @@ The user reports severe deterioration in older-phone high-resolution low-light r
 
 Confirmed code mechanisms include isolated fast-seek samples, 8-bit deep-analysis conversion, luma-only spatial noise, lowest-noise block selection, median pooling, a one-step noise penalty and resolution-first ranking. The contribution of each to the reported problem is unverified.
 
-The new spatial diagnostic prototype is described in the implemented-quality guide. Its controlled results do not establish real-phone detection accuracy or justify new penalties.
+Private evaluation of the first spatial diagnostic found high-variation false positives on clean, finely detailed high-resolution footage, even above 70% eligibility. This demonstrates that its selection rules did not separate detail from noise; coverage was not classification confidence. The replacement temporal experiment is described in the implemented-quality guide, without claiming real-phone accuracy or justifying new penalties.
 
 ## Quality coverage and blind spots
 
@@ -48,10 +48,10 @@ Audio and lip-sync are separate from this picture-quality work.
 | Codec-adjusted bpp | Cheap library-wide compression proxy | Retained as a baseline, not perceptual ground truth |
 | Round-trip SSIM + resdet | Controlled tests supported detail-loss and conventional-upscale detection | Retained for current scoring; neither measures all noise or quality |
 | Spatial Immerkaer | Small NumPy estimator separated clean footage and synthetic strong grain | Retained as a comparison; high-frequency luma coverage is narrow |
-| Multi-scale spatial Y/U/V | Cheaper than motion estimation; controlled correlated/chroma-noise fixtures reveal disturbance missed by the old estimator | Chosen as the first experimental baseline, not yet a calibrated noise score |
+| Multi-scale spatial Y/U/V | Cheaper than motion estimation; controlled correlated/chroma fixtures revealed disturbance, but private testing found clean fine-detail false positives | Rejected as the experimental noise-review ranking after local evaluation |
 | signalstats YDIF/UDIF/VDIF | Adjacent-frame sample differences | Useful trivial temporal baseline; not noise-specific |
 | tblend difference | Consecutive-frame difference image | Useful diagnostic visualization, not automatic severity |
-| Robust motion-aware residuals | Candidate temporal disturbance evidence | Justified only if they improve on spatial and trivial temporal baselines |
+| Robust motion-aware residuals | Stable detail can cancel after alignment, unlike spatial variation; motion, temporal processing and exposure remain confounds | Selected for the next local experiment after spatial specificity failed; usefulness still requires private validation |
 | atadenoise / hqdn3d | Temporal or spatiotemporal denoising | Removed detail/motion can masquerade as removed noise; not default detectors |
 | VBM4D / FastDVDnet | Established multi-frame denoisers | Denoising benchmarks do not validate reference-free quality scoring; heavier dependencies |
 | Dense optical flow | Local alignment | Runtime, interpolation and low-light reliability require evidence before adoption |
@@ -74,6 +74,8 @@ Check the exact software and model-weight licences before any future dependency 
 | Broader review, 2026-11-01 | Treat specialist defects separately from overall quality and artistic preference |
 | Independent Opus review, 2026-11-01 | Verify sampling/range and test a cheaper spatial baseline before temporal complexity |
 | Prototype selection, 2026-11-01 | Opt-in spatial diagnostics separate from scoring; temporal and ranking work remain conditional |
+| Private evaluation, 2026-11-02 | Clean high-resolution detail ranked highly with >70% spatial eligibility; spatial selection was insufficiently specific |
+| Replacement approved, 2026-11-02 | Remove experimental spatial ranking; try aligned consecutive-frame diagnostics while preserving older deep-scoring noise logic and all filename/scoring behaviour |
 
 The independent review identified keyframe-biased sampling, black-floor selection, coarse chroma noise, motion-localized disturbance, periodic refresh, viewing scale, coverage, cache compatibility, privacy and runtime as concerns.
 

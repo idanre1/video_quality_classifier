@@ -1,97 +1,86 @@
 # Noise-diagnostic implementation plan and progress
 
-**Approved scope:** phases 0-1, opt-in local diagnostics, with no new score/group/filename adjustments. Phase 2 remains conditional on baseline evidence and local evaluation.
+**Approved scope:** replace the failed experimental spatial detector with temporal diagnostics. Keep the older `--deep` noise estimate, `N/V` flags and grade penalty unchanged. No new score/group/filename adjustments.
 
-Research, alternatives and sources live in [research.md](research.md). Current implemented behaviour and completed tests live in [SCORING_TESTS.md](SCORING_TESTS.md). This document tracks delivery and gates, not broad research.
+Research and selection history live in [research.md](research.md). Current measurements and rejection rules live in [SCORING_TESTS.md](SCORING_TESTS.md). Usage is in [README.md](README.md).
 
-## Phase 0: trustworthy sampling and representation
+## Phase 0: sampling and representation, retained
 
-Implemented in the opt-in `--noise-diagnostics` path:
+- Accurate seeks, decoded PTS, source-relative times, I/P/B type and keyframe flags.
+- Explicit range-preserving conversion to 16-bit YUV 4:2:0 and normalized SDR code values.
+- Unknown range/transfer, HDR, unsupported formats and sources above the 4K pixel bound abstain.
+- Local-only source protocols, no model/resdet downloads, diagnostic cache versioning and explicit errors.
 
-- Accurate seeks with requested times, decoded PTS, source-relative times, I/P/B type and keyframe flags.
-- Source format/depth/range/transfer, dimensions, FPS, duration and sample aspect ratio.
-- Explicit range-preserving conversion to 16-bit planar YUV; normalized SDR code values, not claimed sensor/linear-light measurements.
-- Conservative unsupported status for unknown range/transfer, HDR, unsupported source formats and sources above the 4K pixel bound.
-- Multiple positions using `--frames`; duplicate timestamps excluded, and insufficient evidence distinguished from cleanliness.
-- One sample decoded/processed at a time per diagnostic worker, at most two concurrent workers, single-threaded diagnostic decoding/filtering, 30-second per-decode timeout and 120-second diagnostic per-file budget.
-- No automatic resdet download when diagnostics are enabled. Existing installed resdet may still be used if `--deep` is also requested.
+## Phase 1: spatial baseline, removed
 
-This does not modify the old fast-seek sampler used for existing scoring. Selected-file full-decode investigations, complete cadence analysis and dynamic display-aspect resampling remain outside the prototype.
+Private evaluation found clean high-resolution fine detail near the top of the spatial-variation report despite >70% eligibility. Synthetic noise sensitivity did not establish sufficient specificity against detail.
 
-**Gate:** verify range/depth equivalence, non-keyframe sampling, output/cache integration and measured resource use. The target-machine runtime and suitability across its codecs remain a local-evaluation gate.
+The spatial residual estimator and its review score have been removed from the experimental path. Existing deep-scoring noise logic is deliberately unaffected, per the user's explicit scope choice.
 
-## Phase 1: multi-scale spatial baseline
+## Phase 2: temporal diagnostic, implemented for another private trial
 
-Implemented:
+- Up to `--frames` four-frame consecutive bursts, with distinct PTS/frame-pair accounting.
+- Global integer translation from phase correlation and pyramid refinement, with a native-patch retry when coarse averaging hides fine detail; no interpolated luma.
+- Plausible-match tiles selected using unclipped content, local temporal change, coarse scene agreement and edge-correlated residual rejection.
+- Separate Y/U/V temporal residuals at native, 2x and 4x scales; native reliability masks also constrain coarser scales; chroma omitted for odd-pixel translations rather than resampled.
+- Cuts/ambiguous matches, exposure changes, irregular timing and identical repeats explicitly rejected/counted.
+- At least two measured pairs per scored burst; per-pair/scale/channel/brightness detail remains in the private cache.
+- Report columns explain temporal residual, reliable coverage and measured/rejected/repeated pairs; no universal severity thresholds.
+- Version-1 spatial cache entries automatically upgrade to version 2 without discarding valid metadata/deep results.
+- At most two workers, one four-frame local temporary decode file per worker, 30-second decode timeout and 120-second diagnostic per-file budget.
 
-- Whole-frame tile measurements at native, 2x and 4x area-averaged scales, with no analysis resize to a different display resolution.
-- Luma-selected eligible tiles: at least 95% unclipped pixels, and low large-scale luma structure after planar detrending.
-- Separate Y/U/V robust residual variation; the 90th percentile retains disturbed eligible areas rather than selecting only the quietest tail.
-- Per-sample scale/channel distributions, brightness bands, four spatial regions and eligible coverage in the cache.
-- A local review report sorted by experimental spatial variation, with requested/actual timestamps and frame types available in cached details.
-- Versioned diagnostic cache signature; old metadata/deep results can be upgraded without repeating a valid old deep result.
-- Explicit unsupported/insufficient/error output. Errors retain existing metadata, but do not become successful diagnostic results.
+**Remaining gate:** useful discrimination on private recordings at acceptable false-positive, abstention and runtime rates. This is not approval for scoring penalties or a claim that temporal evidence proves noise.
 
-The summary is a review-order heuristic, not noise sigma, calibrated severity, affected-video duration, a probability, or proof that texture/grain is unwanted. It does not alter the existing `N/V/D/B/H/S` flags.
+### Known boundaries
 
-**Gate:** controlled correlated-luma/chroma tests must beat the old spatial-luma baseline; clean gradients/black-floor and representation tests must behave correctly. General false-positive/abstention performance still needs local review. Do not automatically promote to temporal work.
+No fractional-pixel alignment, optical flow, rotation/zoom model, general freeze/cadence or periodic-refresh detector is implemented. Complex motion can cause false positives or abstention. Severe/coarse noise may be rejected by reliability rules. Persistent/frozen noise may have low residuals; repeated frames do not establish cleanliness.
 
-## Phase 2: temporal diagnostic, not implemented
-
-Only if phase 1 fails to discriminate the troublesome cases:
-
-1. Decode short consecutive windows, recording actual PTS and frame types.
-2. Start with global alignment and reliable tiles; reject cuts, poor matches and occlusions.
-3. Measure Y/U/V residuals at several scales alongside spatial evidence.
-4. Distinguish global exposure changes from local noise; retain flicker evidence rather than normalizing it away.
-5. Investigate repeated/near-zero residuals and periodic refresh without assuming they mean cleanliness.
-6. Report reliable static/moving coverage and explicit abstention.
-
-**Gate:** improvement beyond phase 1 and trivial frame differences at acceptable cost and abstention. Local flow, CAMBI, ghosting, freeze/cadence, new penalties and ranking changes require further scope approval.
+CAMBI, ghosting, broad perceptual models and ranking changes remain outside this change.
 
 ## Privacy and compatibility contract
 
-- Default commands behave as before; diagnostic values never drive grades, groups or rename flags.
-- No private file/frame/path/metadata is uploaded. All reports and snapshots stay local.
-- Diagnostic-mode source probing and decoding allow only local file/pipe protocols, including existing deep sampling when combined with diagnostics.
-- Diagnostics introduce no dependencies or model downloads.
-- Do not run `--rename` for a read-only evaluation. If explicitly supplied, normal existing renaming still operates independently of diagnostics.
-- Combining `--deep` adds existing frame checks and local snapshots; diagnostics alone does not create snapshots or build resdet.
-- Cache entries contain private paths and numeric results. Do not share the cache or image-bearing reports for debugging.
-- No export feature is implemented; voluntary aggregate-only feedback can be supplied manually.
-- Respect the existing 200-video/picture page limit for diagnostic review pages.
+- Default commands and existing deep scores/flags behave as before.
+- No private file/frame/path/metadata uploads or model downloads.
+- Source probing/decoding in diagnostic mode allows only local file/pipe protocols.
+- No new dependency; temporary decoded data is local and automatically closed/deleted, including failures.
+- Omit `--rename` to leave video and sidecar filenames unchanged. Normal renaming still operates if explicitly requested.
+- Diagnostic-only mode creates no persistent snapshots; combining `--deep` adds existing local snapshots.
+- Cache/reports contain private paths and numerical results. Do not share them or image-bearing reports for debugging.
+- Report pages retain the 200-video/picture limit.
 
 ## Local evaluation procedure
 
-Run:
+Start with a small mixed subset, especially the previous clean-detail false positives:
 
 ```bash
-uv run vqc /path/to/library --noise-diagnostics --deep -j 2
+uv run vqc /path/to/subset --noise-diagnostics --frames 3 -j 1 -o temporal_trial.md
 ```
 
-Omit `--deep` to run diagnostics with metadata-only scoring and no snapshots. Add `--force` when intentionally purging/reprocessing cached videos; it is not needed for the first diagnostic cache upgrade.
+Default broader sampling is eight burst positions. Add `--deep` only if you also want the existing scoring checks/snapshots. `--force` is not needed for the spatial-to-temporal cache upgrade.
 
-Start with a manageable mixed subset: noisy dark recordings, clean dark footage, clean handheld motion, intentional grain, different devices/codecs and HDR/untagged examples. Use consistent playback settings.
+Open `temporal_trial_noise.md` and compare against playback:
 
-Review the `_noise.md` report and its pages. High spatial variation is a candidate to inspect, not automatically poor quality. Check the reason and eligible coverage; unsupported or insufficient evidence is not a clean result.
+1. Clean fine detail, both static and moving, should no longer dominate solely because of detail.
+2. Known noisy low-light recordings should show useful temporal evidence, or explicit abstention rather than a confident clean result.
+3. Check clean dark recordings, handheld motion, cuts/fades, intentional grain and compressed footage for false positives.
+4. Inspect coverage, pair counts and rejection reasons before interpreting the residual number.
 
-Keep related recording sessions together if tuning and evaluation cases are separated. Recheck some labels for consistency. Compare old sigma/bitrate with the spatial review ordering; later temporal evidence must add useful discrimination.
-
-Report severe-case precision/recall or pairwise agreement, false positives, top-ranked usefulness, abstention/coverage and runtime. Numeric subjective acceptance targets are not yet calibrated.
+Do not compare the old spatial number with the new temporal number: they measure different quantities. Anonymous labels, residual/coverage/status and pair counts are sufficient feedback; no recordings or paths are needed.
 
 ## Validation checklist
 
-- [x] Complete existing regression suite plus diagnostic/cache/report tests.
-- [x] Controlled correlated luma and chroma-only disturbance exceeds the old luma-only response.
-- [x] Smooth gradients remain near zero; black-floor-only samples produce insufficient evidence.
-- [x] Controlled 8/10-bit full/limited-range fixtures agree within quantization-aware tolerance.
-- [x] Actual sample times and non-keyframes are verified on long-GOP footage.
-- [x] Default results are unchanged; diagnostic cache upgrades, version changes, errors and pagination work.
-- [x] Build includes the diagnostic module and no new dependency.
-- [x] Measure synthetic high-resolution runtime and Python peak memory.
-- [ ] Measure target-machine runtime and total process memory on representative recordings before database-wide use.
-- [ ] User validates usefulness privately before temporal work or scoring changes.
+- [x] Controlled stable detail, integer translation and injected luma/chroma/correlated-noise separation, including actual 4K detail and all-scale subpixel-motion abstention.
+- [x] Encoded clean-detail/moving-detail controls versus independently noisy versions.
+- [x] Subpixel/local motion, exposure/cut, black-floor, repeated/refresh and irregular-timing checks.
+- [x] Real 8/10-bit full/limited-range residuals checked against quantization-aware expected values and normalized pixels.
+- [x] Real consecutive timestamps/non-keyframes, source offsets and short-clip abstention.
+- [x] Existing scoring/rename regressions, cache migration/errors and report pagination.
+- [x] All 21 regression tests pass; package, Pylance diagnostics, CLI help and documentation links checked.
+- [x] Final synthetic high-resolution resource measurement after all rejection gates.
+- [ ] Private usefulness, false positives, abstention and target-machine total memory/runtime.
+
+Measurements on generated clips do not certify another codec, recording style or machine. FFmpeg child memory must be included when checking the user's total resource budget.
 
 ### Measured resource check
 
-A generated, tagged SDR 3840x2160 H.264 clip at 10 FPS was analyzed with the default eight samples: eight distinct P frames, 12.98 seconds, and 271.4 MiB Python peak resident memory. Fixture generation was excluded from timing; FFmpeg child-process memory is not included in that memory figure. This is a synthetic one-worker observation, not a performance guarantee or a two-worker/long-GOP stress test.
+The final implementation analyzed a generated, tagged SDR 3840x2160 H.264 clip at 10 FPS using eight four-frame bursts: 32 unique frames, 24 measured pairs, 54.83 seconds and 507.2 MiB Python peak resident memory. Fixture generation was excluded from timing; FFmpeg child-process memory is excluded from that memory figure. This is one worker on a synthetic five-second clip, not a long-GOP, two-worker or real-library performance guarantee.
